@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""
+comic — Unified dispatcher for the comic toolchain.
+
+Maps subcommands to comic-{subcommand} executables:
+    comic blog --list-styles   →  comic-blog --list-styles
+    comic qa page.png          →  comic-qa page.png
+    comic frame happy          →  comic-frame happy
+    comic page --notes day.md  →  comic-page --notes day.md
+"""
+
+import os
+import sys
+from pathlib import Path
+
+PROG = "comic"
+
+
+def find_subcommands():
+    """Discover comic-* tools in the same directory as this script."""
+    bin_dir = Path(__file__).resolve().parent
+    prefix = "comic-"
+    cmds = {}
+    for entry in bin_dir.iterdir():
+        if entry.name.startswith(prefix) and entry.is_file() and os.access(entry, os.X_OK):
+            name = entry.name[len(prefix):]
+            cmds[name] = str(entry)
+    return cmds
+
+
+def print_help(cmds):
+    print(f"usage: {PROG} <command> [args...]\n")
+    print("Available commands:\n")
+    if cmds:
+        width = max(len(n) for n in cmds)
+        for name in sorted(cmds):
+            print(f"  {name:<{width}}  →  comic-{name}")
+    else:
+        print("  (none found)")
+    print(f"\nRun '{PROG} <command> --help' for command-specific help.")
+
+
+def main():
+    cmds = find_subcommands()
+
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print_help(cmds)
+        sys.exit(0)
+
+    subcmd = sys.argv[1]
+    tool = cmds.get(subcmd)
+
+    if tool is None:
+        # Also check PATH in case a tool isn't co-located
+        import shutil
+        tool = shutil.which(f"comic-{subcmd}")
+
+    if tool is None:
+        print(f"{PROG}: unknown command '{subcmd}'", file=sys.stderr)
+        print(f"Run '{PROG} --help' to see available commands.", file=sys.stderr)
+        sys.exit(1)
+
+    os.execvp(tool, [f"comic-{subcmd}"] + sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()

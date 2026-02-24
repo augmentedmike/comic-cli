@@ -2,14 +2,28 @@
 
 CLI tools for generating comic book frames, pages, and blog posts.
 
+## Unified `comic` command
+
+A single entry point that dispatches to all tools:
+
+```bash
+comic frame happy              # → comic-frame happy
+comic page --notes day.md      # → comic-page --notes day.md
+comic blog --list-styles       # → comic-blog --list-styles
+comic qa page.png              # → comic-qa page.png
+comic --help                   # list available subcommands
+```
+
+The individual `comic-*` commands still work standalone.
+
 ## Tools
 
 | Command | Description |
 |---------|-------------|
-| `comic-frame` | Generate a single portrait frame with one of 57 expressions or a custom prompt |
-| `comic-page` | Compose multi-panel comic pages from scenes JSON or timestamped notes |
-| `comic-blog` | Full pipeline: notes/topic &rarr; AI panels &rarr; composited pages &rarr; HTML blog |
-| `comic-qa` | Visual quality check using pixel analysis + Gemini vision |
+| `comic frame` | Generate a single portrait frame with one of 57 expressions or a custom prompt |
+| `comic page` | Compose multi-panel comic pages from scenes JSON or timestamped notes |
+| `comic blog` | Full pipeline: notes/topic &rarr; AI panels &rarr; composited pages &rarr; HTML blog |
+| `comic qa` | Visual quality check using pixel analysis + Gemini vision |
 
 ## Libraries
 
@@ -29,33 +43,33 @@ pip install -r requirements.txt
 ### Generate a frame
 
 ```bash
-comic-frame happy
-comic-frame --prompt "lightbulb moment, eyes wide"
-comic-frame --list          # show all 57 expressions
+comic frame happy
+comic frame --prompt "lightbulb moment, eyes wide"
+comic frame --list          # show all 57 expressions
 ```
 
 ### Build a comic page
 
 ```bash
-comic-page --notes day.md --frames 6 --title "Monday"
-comic-page --scenes scenes.json --layout morning
-comic-page --list-layouts   # show all layout presets
+comic page --notes day.md --frames 6 --title "Monday"
+comic page --scenes scenes.json --layout morning
+comic page --list-layouts   # show all layout presets
 ```
 
 ### Generate a blog post
 
 ```bash
-comic-blog --notes day.md --title "My Monday" --style comic
-comic-blog --topic "shipping a feature at 2am" --pages 2
-comic-blog --list-styles    # comic, manga, noir, retro, watercolor, sketch, pop-art
+comic blog --notes day.md --title "My Monday" --style comic
+comic blog --topic "shipping a feature at 2am" --pages 2
+comic blog --list-styles    # comic, manga, noir, retro, watercolor, sketch, pop-art
 ```
 
 ### QA a page
 
 ```bash
-comic-qa page.png
-comic-qa page1.png page2.png --fast
-comic-qa page.png --no-vision   # pixel checks only
+comic qa page.png
+comic qa page1.png page2.png --fast
+comic qa page.png --no-vision   # pixel checks only
 ```
 
 ## Page spec
