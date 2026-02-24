@@ -1,0 +1,852 @@
+#!/usr/bin/env python3
+"""
+crabby-comic — Full comic page generator for Crabby.
+
+Turns a scenes JSON file (or a notes .md file) into a full
+standard-format American comic book page: multiple panels,
+gutters, borders, and caption boxes.
+
+Standard US comic page:
+  Trim:  6.625" × 10.25"  →  1988 × 3075 px @ 300 DPI
+  Bleed: 6.875" × 10.5"   →  2063 × 3150 px @ 300 DPI
+
+Usage:
+    crabby-comic --scenes scenes.json
+    crabby-comic --scenes scenes.json --layout 1,2,2,2 --output my-comic.png
+    crabby-comic --notes memory/2026-02-22-notes.md --frames 7
+    crabby-comic --scaffold scenes.json   # create a starter scenes file
+    crabby-comic --list-layouts
+"""
+
+import argparse
+import datetime
+import json
+import logging
+import os
+import re
+import sys
+import warnings
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*urllib3.*")
+
+try:
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
+except ImportError:
+    print("Pillow required: pip install pillow", file=sys.stderr)
+    sys.exit(1)
+
+# ---------------------------------------------------------------------------
+# Standard US Comic Book constants @ 300 DPI
+# ---------------------------------------------------------------------------
+
+PAGE_W       = 1988   # 6.625" × 300
+PAGE_H       = 3075   # 10.25" × 300
+MARGIN       = 48     # page margin in px
+GUTTER       = 18     # space between panels
+BORDER_W     = 4      # panel border thickness
+CAPTION_H    = 72     # caption box height at bottom of each panel
+
+BG_COLOR     = (255, 255, 255)
+BORDER_COLOR = (12,  12,  12 )
+CAPTION_BG   = (12,  12,  12 )
+CAPTION_FG   = (255, 255, 255)
+
+# ---------------------------------------------------------------------------
+# Layout system
+#
+# A layout is a list of rows. Each row is:
+#   (row_height_weight, [col_weight, col_weight, ...])
+#
+# Row height weights are relative — a row with weight 2 gets twice the
+# vertical space of a row with weight 1. Column weights work the same
+# within each row.
+#
+# This produces real comic book layouts where important panels are bigger.
+# ---------------------------------------------------------------------------
+
+# Type alias for clarity
+Layout = List[Tuple[int, List[int]]]   # [(row_h_weight, [col_weights]), ...]
+
+
+LAYOUTS: Dict[str, Layout] = {
+
+    # ---- simple / grid fallbacks ----------------------------------------
+    "splash-1":   [(1, [1])],
+    "splash-2":   [(1, [1]), (1, [1])],
+    "spread-3":   [(1, [1]), (1, [1]), (1, [1])],
+    "grid-4":     [(1, [1, 1]), (1, [1, 1])],
+    "grid-6":     [(1, [1, 1]), (1, [1, 1]), (1, [1, 1])],
+    "grid-9":     [(1, [1, 1, 1]), (1, [1, 1, 1]), (1, [1, 1, 1])],
+
+    # ---- cinematic 6-panel layouts (real comic feel) --------------------
+
+    # Classic: wide opener, two beats, climax panel is double-wide
+    "morning":    [
+        (2,  [1]),         # full-width establishing shot  (tall)
+        (1,  [1, 1]),      # two equal beats
+        (1,  [1, 1, 2]),   # small + small + wide climax
+    ],
+
+    # Afternoon: feature + full-width drama + resolution
+    "afternoon":  [
+        (1,  [1, 2]),      # small sidebar + wide feature
+        (2,  [1]),         # full-width dramatic beat      (tall)
+        (1,  [2, 1]),      # wide insight + narrow button
+        (1,  [1]),         # full-width resolution
+    ],
+
+    # Action: diagonal feel — wide+narrow, two equal, narrow+wide  (6 panels)
+    "action-6":   [
+        (1,  [2, 1]),      # wide + narrow
+        (1,  [1, 1]),      # two equal
+        (1,  [1, 2]),      # narrow + wide closer
+    ],
+
+    # Feature: splash top, three beats, button  (6 panels)
+    "feature-6":  [
+        (2,  [1]),         # full-width splash
+        (1,  [1, 1, 1]),   # three beats
+        (1,  [1, 1]),      # two-panel button row
+    ],
+
+    # Talking heads: alternating wide/narrow for dialogue rhythm  (6 panels)
+    "dialogue-6": [
+        (1,  [2, 1]),
+        (1,  [1, 2]),
+        (1,  [2, 1]),
+    ],
+
+    # ---- 7-panel cinematic  (1+2+2+2 = 7) ------------------------------
+    "story-7":    [
+        (2,  [1]),         # wide establishing
+        (1,  [1, 1]),      # two beats
+        (1,  [1, 2]),      # small + wide
+        (1,  [1, 1]),      # two closing beats
+    ],
+
+    # ---- 8-panel  (1+3+2+2 = 8) ----------------------------------------
+    "drama-8":    [
+        (2,  [1]),
+        (1,  [1, 1, 1]),
+        (1,  [2, 1]),
+        (1,  [1, 1]),
+    ],
+
+    # ---- 5-panel --------------------------------------------------------
+    "feature-5":  [
+        (2,  [1]),
+        (1,  [1, 1]),
+        (1,  [1, 1]),
+    ],
+
+    # ---- 4-panel --------------------------------------------------------
+    "classic-4":  [
+        (1,  [2, 1]),
+        (1,  [1, 2]),
+    ],
+}
+
+# ---------------------------------------------------------------------------
+# Config  (same config.json as crabby-express)
+# ---------------------------------------------------------------------------
+
+CONFIG_PATH = Path.home() / "Desktop" / "crabby" / "config.json"
+
+
+def load_config() -> Dict:
+    if not CONFIG_PATH.exists():
+        print(f"Config not found: {CONFIG_PATH}", file=sys.stderr)
+        sys.exit(1)
+    with open(CONFIG_PATH) as f:
+        cfg = json.load(f)
+    cfg["output_dir"] = str(Path(cfg["output_dir"]).expanduser())
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Logging  (everything to stderr so stdout stays clean for the output path)
+# ---------------------------------------------------------------------------
+
+def setup_logging(verbose: bool = False):
+    root = logging.getLogger()
+    root.handlers.clear()
+    h = logging.StreamHandler(sys.stderr)
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S"))
+    root.addHandler(h)
+    root.setLevel(logging.DEBUG if verbose else logging.INFO)
+
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Layout engine
+# ---------------------------------------------------------------------------
+
+def count_panels(layout: "Layout") -> int:
+    return sum(len(cols) for _, cols in layout)
+
+
+def compute_panel_rects(layout: "Layout") -> List[Tuple[int, int, int, int]]:
+    """
+    Return (x, y, w, h) for each panel in reading order (left→right, top→bottom).
+
+    Each row's height is proportional to its row_height_weight.
+    Each column's width within a row is proportional to its col_weight.
+    """
+    content_w = PAGE_W - 2 * MARGIN
+    content_h = PAGE_H - 2 * MARGIN
+    num_rows   = len(layout)
+
+    # Total height available after gutters between rows
+    gutter_total_h = GUTTER * (num_rows - 1)
+    available_h    = content_h - gutter_total_h
+
+    # Distribute row heights by weight
+    total_row_weight = sum(rh for rh, _ in layout)
+    row_heights = [int(available_h * rh / total_row_weight) for rh, _ in layout]
+
+    rects: List[Tuple[int, int, int, int]] = []
+    y = MARGIN
+    for row_idx, (_, col_weights) in enumerate(layout):
+        rh        = row_heights[row_idx]
+        num_cols  = len(col_weights)
+        total_col_weight  = sum(col_weights)
+        gutter_total_w    = GUTTER * (num_cols - 1)
+        available_w       = content_w - gutter_total_w
+
+        x = MARGIN
+        for cw in col_weights:
+            panel_w = int(available_w * cw / total_col_weight)
+            rects.append((x, y, panel_w, rh))
+            x += panel_w + GUTTER
+
+        y += rh + GUTTER
+
+    return rects
+
+
+def parse_layout(layout_spec: str) -> "Layout":
+    """
+    Parse a layout from a string name (preset) or inline spec.
+
+    Inline spec format: rows separated by '|', columns by ',', height weight prefix 'Nx:'
+      e.g.  '2:[1] | 1:[1,1] | 1:[1,1,2]'
+    Or just a preset name: 'morning', 'afternoon', 'drama-8', etc.
+    """
+    spec = layout_spec.strip()
+
+    # Named preset?
+    if spec in LAYOUTS:
+        return LAYOUTS[spec]
+
+    # Inline format: '2:[1] | 1:[1,1] | 1:[1,2]'
+    if "|" in spec or ":[" in spec:
+        rows = []
+        for row_str in spec.split("|"):
+            row_str = row_str.strip()
+            if ":[" in row_str:
+                parts = row_str.split(":[", 1)
+                rh    = int(parts[0].strip())
+                cols  = [int(c.strip()) for c in parts[1].rstrip("]").split(",")]
+            elif ":" in row_str:
+                parts = row_str.split(":", 1)
+                rh    = int(parts[0].strip())
+                cols  = [int(c.strip()) for c in parts[1].split(",")]
+            else:
+                cols = [int(c.strip()) for c in row_str.split(",")]
+                rh   = 1
+            rows.append((rh, cols))
+        return rows
+
+    # Legacy simple format: '1,2,2,2' → equal-height rows with N equal columns
+    try:
+        panel_counts = [int(x.strip()) for x in spec.split(",") if x.strip()]
+        if panel_counts:
+            return [(1, [1] * n) for n in panel_counts]
+    except ValueError:
+        pass
+
+    print(f"Unknown layout: {spec!r}  — use a preset name or inline spec like '2:[1] | 1:[1,1]'",
+          file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Font helpers
+# ---------------------------------------------------------------------------
+
+def get_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
+    candidates = []
+    if bold:
+        candidates += [
+            "/System/Library/Fonts/Supplemental/Comic Sans MS Bold.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/Library/Fonts/Arial Bold.ttf",
+        ]
+    candidates += [
+        "/System/Library/Fonts/Supplemental/Comic Sans MS.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/SFNSText.ttf",
+        "/Library/Fonts/Arial.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+
+# ---------------------------------------------------------------------------
+# Caption text renderer
+# ---------------------------------------------------------------------------
+
+def draw_wrapped_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    x: int,
+    y: int,
+    max_w: int,
+    max_h: int,
+    color: Tuple,
+):
+    words  = text.split()
+    lines: List[str] = []
+    current = ""
+    for word in words:
+        test = (current + " " + word).strip()
+        bbox = draw.textbbox((0, 0), test, font=font)
+        if bbox[2] <= max_w:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+
+    line_h = (font.size if hasattr(font, "size") else 16) + 5
+    for i, line in enumerate(lines):
+        if i * line_h >= max_h:
+            break
+        draw.text((x, y + i * line_h), line, font=font, fill=color)
+
+
+# ---------------------------------------------------------------------------
+# Page compositor
+# ---------------------------------------------------------------------------
+
+def composite_page(
+    frame_paths: List[Optional[str]],
+    panel_rects: List[Tuple[int, int, int, int]],
+    captions: List[str],
+    output_path: str,
+    title: Optional[str] = None,
+) -> str:
+    page  = Image.new("RGB", (PAGE_W, PAGE_H), BG_COLOR)
+    draw  = ImageDraw.Draw(page)
+    c_font = get_font(22)
+    t_font = get_font(36, bold=True)
+    n_font = get_font(18)
+
+    # Title in top margin
+    if title:
+        draw.text((MARGIN, 10), title.upper(), font=t_font, fill=(20, 20, 20))
+
+    for i, (rect, fpath, caption) in enumerate(zip(panel_rects, frame_paths, captions)):
+        x, y, w, h = rect
+
+        # Outer border (slightly larger rectangle, then panel on top)
+        draw.rectangle(
+            [x - BORDER_W, y - BORDER_W, x + w + BORDER_W, y + h + BORDER_W],
+            fill=BORDER_COLOR,
+        )
+
+        # Image content area (above caption box)
+        content_h = h - CAPTION_H
+
+        if fpath and Path(fpath).exists():
+            try:
+                frame = Image.open(fpath).convert("RGB")
+                frame = ImageOps.fit(frame, (w, content_h), Image.LANCZOS)
+                page.paste(frame, (x, y))
+            except Exception as e:
+                logger.warning(f"Panel {i+1}: could not load {fpath}: {e}")
+                _placeholder(draw, x, y, w, content_h, i + 1, n_font)
+        else:
+            _placeholder(draw, x, y, w, content_h, i + 1, n_font)
+
+        # Caption box
+        cap_y = y + content_h
+        draw.rectangle([x, cap_y, x + w, y + h], fill=CAPTION_BG)
+        if caption:
+            draw_wrapped_text(
+                draw, caption, c_font,
+                x + 10, cap_y + 10,
+                w - 20, CAPTION_H - 20,
+                CAPTION_FG,
+            )
+
+        # Small panel number, top-left
+        draw.text((x + 8, y + 6), str(i + 1), font=n_font, fill=(220, 220, 220))
+
+    page.save(output_path, "PNG", dpi=(300, 300))
+    logger.info(f"✓ Comic page saved → {output_path}")
+    return output_path
+
+
+def _placeholder(draw, x, y, w, h, num, font):
+    draw.rectangle([x, y, x + w, y + h], fill=(210, 210, 210))
+    draw.text((x + w // 2 - 20, y + h // 2 - 10), f"Panel {num}", font=font, fill=(120, 120, 120))
+
+
+# ---------------------------------------------------------------------------
+# Notes parser  (HH:MM | note text)
+# ---------------------------------------------------------------------------
+
+NOTE_RE = re.compile(r"^(\d{2}:\d{2})\s*\|\s*(.+)$")
+
+
+def parse_notes(notes_path: str) -> List[Dict]:
+    entries = []
+    with open(notes_path) as f:
+        for line in f:
+            m = NOTE_RE.match(line.strip())
+            if m:
+                entries.append({"time": m.group(1), "text": m.group(2).strip()})
+    return entries
+
+
+def auto_select_frames(entries: List[Dict], n: int) -> List[Dict]:
+    """
+    Pick the n most story-worthy entries.
+    Priority: bookend entries → tagged entries → ideas → evenly spaced fill.
+    """
+    # Tags may have suffixes inside brackets: [CLIENT CLOSED] or [PIPELINE — enterprise, high intent]
+    PRIORITY_PATTERNS = [
+        re.compile(r"\[CLIENT CLOSED[^\]]*\]"),
+        re.compile(r"\[POTENTIAL CLOSE[^\]]*\]"),
+        re.compile(r"\[PIPELINE[^\]]*\]"),
+        re.compile(r"\[LEAD[^\]]*\]"),
+    ]
+
+    def is_priority(text: str) -> bool:
+        return any(p.search(text) for p in PRIORITY_PATTERNS)
+
+    # Tier 1: always include first + last (narrative bookends)
+    tier1 = [entries[0]] if entries else []
+    if len(entries) > 1:
+        tier1.append(entries[-1])
+
+    # Tier 2: business/story events (deals, pipeline, leads)
+    tier2 = [e for e in entries if is_priority(e["text"])]
+
+    # Tier 3: ideas
+    tier3 = [e for e in entries if e["text"].lower().startswith("idea:")]
+
+    # Tier 4: everything else for fill
+    tier4 = [e for e in entries if e not in tier1 + tier2 + tier3]
+
+    seen: set = set()
+    ordered: List[Dict] = []
+
+    def add(candidates):
+        for e in candidates:
+            if e["time"] not in seen and len(ordered) < n:
+                seen.add(e["time"])
+                ordered.append(e)
+
+    add(tier1)
+    add(tier2)
+    add(tier3)
+    add(tier4)
+
+    ordered.sort(key=lambda e: e["time"])
+    return ordered[:n]
+
+
+def entry_to_prompt(entry: Dict) -> str:
+    """Convert a notes entry to a Gemini scene prompt."""
+    text = entry["text"]
+    t    = text.lower()
+
+    if "[client closed]" in t:
+        mood = "triumphant and elated — just closed a deal, big grin, maybe a fist pump"
+    elif "[potential close]" in t:
+        mood = "focused and confident, mid-business call, leaning forward with intent"
+    elif "[pipeline]" in t or "[lead]" in t:
+        mood = "engaged and measured, negotiating, slight caution mixed with excitement"
+    elif "idea:" in t:
+        mood = "sudden realization — eyes wide, lightbulb moment, energized and surprised"
+    elif any(w in t for w in ("fixed", "merged", "shipped", "pushed")):
+        mood = "quietly satisfied, head down at the computer, task complete"
+    elif any(w in t for w in ("lunch", "coffee", "break")):
+        mood = "relaxed and off-duty, leaning back, taking a breath"
+    elif "deep work" in t:
+        mood = "fully locked in — headphones on, intense concentration, flow state"
+    elif any(w in t for w in ("call", "standup", "meeting")):
+        mood = "attentive and present, on a call, listening or speaking"
+    elif any(w in t for w in ("review", "figma", "mockup", "design")):
+        mood = "thoughtful and critical, studying something on screen, giving feedback"
+    elif any(w in t for w in ("roadmap", "decision", "prioritize")):
+        mood = "decisive and deliberate, making a key call, composed authority"
+    else:
+        mood = "focused and working, at the desk, in the flow"
+
+    return (
+        f"COMIC PANEL SCENE at {entry['time']}: {text[:140]}. "
+        f"Character mood/expression: {mood}. "
+        "Comic book art style — bold ink outlines, flat halftone colors, cross-hatch shadows. "
+        "Full environment visible: desk, room, props relevant to the scene. "
+        "16:9 widescreen panel composition, cinematic framing."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scene JSON helpers
+# ---------------------------------------------------------------------------
+
+def load_scenes(path: str) -> List[Dict]:
+    with open(path) as f:
+        scenes = json.load(f)
+    for i, s in enumerate(scenes):
+        if "caption" not in s or "prompt" not in s:
+            print(f"Scene {i+1} missing 'caption' or 'prompt'.", file=sys.stderr)
+            sys.exit(1)
+    return scenes
+
+
+def scaffold_scenes(output_path: str, n: int = 7):
+    scenes = [
+        {
+            "id": i,
+            "time": f"{8+i:02d}:00",
+            "caption": f"Panel {i} caption — what happened here.",
+            "prompt": (
+                f"Describe panel {i} scene here. "
+                "Include: setting, what Crabby is doing, mood/expression, props."
+            ),
+        }
+        for i in range(1, n + 1)
+    ]
+    with open(output_path, "w") as f:
+        json.dump(scenes, f, indent=2)
+    print(f"Scaffold written → {output_path}  (edit captions and prompts, then run with --scenes)")
+
+
+# ---------------------------------------------------------------------------
+# Frame generation
+# ---------------------------------------------------------------------------
+
+def generate_frames(
+    scenes: List[Dict],
+    config: Dict,
+    output_dir: Path,
+    cache: bool = False,
+) -> List[Optional[str]]:
+    env_file = config.get("env_file", "")
+    if env_file and Path(env_file).exists():
+        from dotenv import load_dotenv
+        load_dotenv(env_file, override=True)
+
+    gen_path = config.get("generator_path", "")
+    if gen_path not in sys.path:
+        sys.path.insert(0, gen_path)
+
+    from generate_portrait import PortraitGenerator
+    gen         = PortraitGenerator()
+    gen.output_dir = output_dir
+    reference   = config["reference"]
+    styles      = config["styles"]
+    paths: List[Optional[str]] = []
+
+    for i, scene in enumerate(scenes, 1):
+        sid   = scene.get("id", i)
+        fname = f"panel_{sid:02d}.png"
+        out   = output_dir / fname
+
+        if cache and out.exists():
+            logger.info(f"[{i}/{len(scenes)}] Panel {sid}: cached ✓")
+            paths.append(str(out))
+            continue
+
+        if out.exists():
+            out.unlink()
+
+        logger.info(f"[{i}/{len(scenes)}] Generating panel {sid} — {scene['caption'][:50]}...")
+        result = gen.generate_portrait(
+            person_image_path=reference,
+            style_image_paths=styles,
+            prompt=scene["prompt"],
+            output_name=fname,
+        )
+        if result:
+            logger.info(f"  ✓ saved {fname}")
+            paths.append(result)
+        else:
+            logger.warning(f"  ✗ panel {sid} failed — placeholder will be used")
+            paths.append(None)
+
+    return paths
+
+
+# ---------------------------------------------------------------------------
+# Spread helper — splits scenes across N pages and composites each
+# ---------------------------------------------------------------------------
+
+# Default cinematic layout per panel count
+_CINEMATIC_DEFAULTS: Dict[int, str] = {
+    1: "splash-1",
+    2: "splash-2",
+    3: "spread-3",
+    4: "classic-4",
+    5: "feature-5",
+    6: "morning",
+    7: "story-7",
+    8: "drama-8",
+    9: "grid-9",
+}
+
+
+def resolve_layout(n_panels: int, hint: Optional[str] = None) -> "Layout":
+    """Return a Layout for n_panels, respecting an optional preset/spec hint."""
+    if hint:
+        return parse_layout(hint)
+    preset_name = _CINEMATIC_DEFAULTS.get(n_panels)
+    if preset_name:
+        return LAYOUTS[preset_name]
+    # Fallback: equal-height rows of 2
+    full_rows = n_panels // 2
+    remainder = n_panels % 2
+    rows = [(1, [1, 1])] * full_rows
+    if remainder:
+        rows.append((1, [1]))
+    return rows
+
+
+def generate_spread(
+    scenes: List[Dict],
+    frame_paths: List[Optional[str]],
+    n_pages: int,
+    layout_hint: Optional[str],
+    output_dir: Path,
+    datestamp: str,
+    title: Optional[str],
+    output_stem: Optional[str],
+) -> List[str]:
+    """
+    Split scenes + frame_paths across n_pages and composite each page.
+    Returns list of output file paths (one per page).
+    """
+    total     = len(scenes)
+    # Distribute panels as evenly as possible across pages
+    base, rem = divmod(total, n_pages)
+    page_sizes = [base + (1 if i < rem else 0) for i in range(n_pages)]
+
+    out_paths: List[str] = []
+    cursor = 0
+    for pg_idx, pg_size in enumerate(page_sizes, 1):
+        pg_scenes  = scenes[cursor: cursor + pg_size]
+        pg_frames  = frame_paths[cursor: cursor + pg_size]
+        cursor    += pg_size
+
+        # For page 1 of 2 use "morning", page 2 use "afternoon" if hint not set
+        if layout_hint is None and n_pages == 2 and pg_size == 6:
+            page_hint = "morning" if pg_idx == 1 else "afternoon"
+        else:
+            page_hint = layout_hint
+
+        layout      = resolve_layout(pg_size, page_hint)
+        total_slots = count_panels(layout)
+        layout_desc = page_hint or f"auto-{pg_size}"
+
+        pg_captions = [s.get("caption", "") for s in pg_scenes]
+        while len(pg_frames)   < total_slots: pg_frames.append(None)
+        while len(pg_captions) < total_slots: pg_captions.append("")
+
+        # Output filename
+        if output_stem and n_pages == 1:
+            out_path = output_stem
+        elif output_stem:
+            stem = Path(output_stem)
+            out_path = str(stem.parent / f"{stem.stem}-p{pg_idx}{stem.suffix}")
+        else:
+            out_path = str(output_dir / f"comic-{datestamp}-p{pg_idx}.png")
+
+        pg_title = f"{title} — p.{pg_idx}" if title else None
+        logger.info(f"Compositing page {pg_idx}/{n_pages}: layout={layout_desc}, panels={pg_size}")
+
+        composite_page(
+            frame_paths=pg_frames,
+            panel_rects=compute_panel_rects(layout),
+            captions=pg_captions,
+            output_path=out_path,
+            title=pg_title,
+        )
+        out_paths.append(out_path)
+
+    return out_paths
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    setup_logging()
+    config = load_config()
+
+    parser = argparse.ArgumentParser(
+        prog="crabby-comic",
+        description="Generate one or more comic book pages from scenes or a notes file.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  crabby-comic --notes memory/2026-02-22-notes.md --frames 7
+  crabby-comic --notes memory/2026-02-22-notes.md --pages 2 --title "A Day in the Life"
+  crabby-comic --scenes scenes.json --layout 1,2,2,2 --title "My Day"
+  crabby-comic --scaffold scenes.json --frames 7
+  crabby-comic --compose-only ~/Desktop/crabby/expressions/comic/ --pages 2
+  crabby-comic --list-layouts
+
+Page spec: 6.625 x 10.25 in @ 300 DPI = 1988 x 3075 px
+        """,
+    )
+
+    src = parser.add_mutually_exclusive_group()
+    src.add_argument("--scenes",       "-s", metavar="FILE.json", help="JSON scene definitions")
+    src.add_argument("--notes",        "-n", metavar="FILE.md",   help="Notes .md file (auto-extracts frames)")
+    src.add_argument("--scaffold",           metavar="OUTPUT.json",help="Write a starter scenes JSON and exit")
+    src.add_argument("--compose-only",       metavar="DIR",        help="Compose existing panel_NN.png images from DIR")
+
+    parser.add_argument("--frames",    "-f", type=int, default=None,
+                        help="Panels per page when using --notes (default: 6 for 1 page, 12 for 2 pages, etc.)")
+    parser.add_argument("--pages",     "-p", type=int, default=1,
+                        help="Number of comic pages to generate (default: 1)")
+    parser.add_argument("--layout",    "-l", default=None,
+                        help="Layout per page — preset name or row spec e.g. '1,2,2,2'  (auto if omitted)")
+    parser.add_argument("--output",    "-o", metavar="FILE.png",
+                        help="Output path stem. For multi-page: -p1, -p2 suffixes added automatically.")
+    parser.add_argument("--title",     "-t", default=None,
+                        help="Page title text (shown in top margin)")
+    parser.add_argument("--cache",           action="store_true",
+                        help="Reuse already-generated panel images")
+    parser.add_argument("--list-layouts",    action="store_true",
+                        help="List built-in layout presets and exit")
+    parser.add_argument("--verbose",   "-v", action="store_true")
+
+    args = parser.parse_args()
+
+    if args.verbose:
+        setup_logging(verbose=True)
+
+    # --list-layouts
+    if args.list_layouts:
+        print("\nBuilt-in layout presets:\n")
+        for name, layout in LAYOUTS.items():
+            total  = count_panels(layout)
+            n_rows = len(layout)
+            print(f"  {name:<16}  {n_rows} rows  {total} panels")
+        print()
+        sys.exit(0)
+
+    # --scaffold
+    if args.scaffold:
+        n = args.frames or 7
+        scaffold_scenes(args.scaffold, n)
+        sys.exit(0)
+
+    if not args.scenes and not args.notes and not args.compose_only:
+        parser.error("Provide --scenes, --notes, or --compose-only.")
+
+    n_pages = max(1, args.pages)
+
+    # ------------------------------------------------------------------
+    # Determine total frame count
+    # ------------------------------------------------------------------
+
+    # Default panels per page: 6 (classic-6 is the workhorse layout)
+    PANELS_PER_PAGE = 6
+
+    if args.frames:
+        total_frames = args.frames * n_pages if n_pages > 1 and args.frames < 4 else args.frames
+    else:
+        total_frames = PANELS_PER_PAGE * n_pages
+
+    # ------------------------------------------------------------------
+    # Build scene list
+    # ------------------------------------------------------------------
+
+    if args.scenes:
+        scenes = load_scenes(args.scenes)
+
+    elif args.notes:
+        entries = parse_notes(args.notes)
+        if not entries:
+            print(f"No 'HH:MM | text' entries found in {args.notes}", file=sys.stderr)
+            sys.exit(1)
+        selected = auto_select_frames(entries, total_frames)
+        scenes = [
+            {
+                "id":      i + 1,
+                "time":    e["time"],
+                "caption": e["text"][:100],
+                "prompt":  entry_to_prompt(e),
+            }
+            for i, e in enumerate(selected)
+        ]
+        logger.info(f"Selected {len(scenes)} frames from {len(entries)} entries across {n_pages} page(s):")
+        for s in scenes:
+            logger.info(f"  [{s['time']}] {s['caption'][:65]}")
+
+    else:
+        scenes = []  # compose-only
+
+    # ------------------------------------------------------------------
+    # Output dir
+    # ------------------------------------------------------------------
+
+    output_dir = Path(config["output_dir"]) / "comic"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    datestamp  = datetime.date.today().isoformat()
+
+    # ------------------------------------------------------------------
+    # Generate all frames in one pass
+    # ------------------------------------------------------------------
+
+    if args.compose_only:
+        compose_dir = Path(args.compose_only)
+        frame_paths: List[Optional[str]] = sorted(str(p) for p in compose_dir.glob("panel_*.png"))
+        logger.info(f"Compose-only: {len(frame_paths)} panels in {compose_dir}")
+        if not scenes:
+            # Build dummy scenes list for caption/count purposes
+            scenes = [{"id": i+1, "caption": ""} for i in range(len(frame_paths))]
+    else:
+        frame_paths = generate_frames(scenes, config, output_dir, cache=args.cache)
+
+    # ------------------------------------------------------------------
+    # Composite: single page or multi-page spread
+    # ------------------------------------------------------------------
+
+    out_paths = generate_spread(
+        scenes=scenes,
+        frame_paths=frame_paths,
+        n_pages=n_pages,
+        layout_hint=args.layout,
+        output_dir=output_dir,
+        datestamp=datestamp,
+        title=args.title,
+        output_stem=args.output,
+    )
+
+    for p in out_paths:
+        print(p)
+
+
+if __name__ == "__main__":
+    main()

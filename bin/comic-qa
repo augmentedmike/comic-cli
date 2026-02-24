@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""
+comic-qa — Visual quality check for comic pages.
+
+Uses Google Gemini vision to inspect a comic page image and report on:
+  - Aspect ratio / stretching issues
+  - Panel layout quality
+  - Character consistency
+  - Art style consistency
+  - Text rendering
+  - Overall readability
+
+Usage:
+    comic-qa page.png
+    comic-qa page1.png page2.png          # compare across spread
+    comic-qa ~/Desktop/crabby/expressions/comic/fixed-p1.png --verbose
+    comic-qa *.png --fast                  # short report, no details
+"""
+
+import argparse
+import json
+import os
+import sys
+import warnings
+from pathlib import Path
+from typing import List
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*urllib3.*")
+
+try:
+    from PIL import Image
+except ImportError:
+    print("Pillow required: pip install pillow", file=sys.stderr)
+    sys.exit(1)
+
+# Gemini API key — same source as the rest of the project
+ENV_FILE = Path.home() / "Desktop" / "youtube-channel" / ".env"
+
+
+def load_api_key() -> str:
+    key = os.getenv("GOOGLE_API_KEY", "")
+    if not key and ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            if line.startswith("GOOGLE_API_KEY="):
+                key = line.split("=", 1)[1].strip()
+                break
+    if not key:
+        print("GOOGLE_API_KEY not found. Set it in the environment or in ~/Desktop/youtube-channel/.env",
+              file=sys.stderr)
+        sys.exit(1)
+    return key
+
+
+def load_gemini():
+    """Import and configure the Gemini SDK."""
+    api_key = load_api_key()
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=api_key)
+        return genai
+    except ImportError:
+        print("google-generativeai required: pip install google-generativeai", file=sys.stderr)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Pixel-level checks (no API needed)
+# ---------------------------------------------------------------------------
+
+def pixel_checks(path: str) -> dict:
+    """Fast checks using Pillow only — no API calls."""
+    img  = Image.open(path)
+    w, h = img.size
+    ar   = w / h
+
+    results = {
+        "path":        path,
+        "dimensions":  f"{w}×{h}",
+        "aspect_ratio": f"{ar:.3f}",
+    }
+
+    # Expected US comic page ratio: 1988/3075 ≈ 0.646
+    EXPECTED_AR = 1988 / 3075
+    ar_drift = abs(ar - EXPECTED_AR) / EXPECTED_AR
+    if ar_drift < 0.02:
+        results["page_ratio"] = "✓ correct (US comic book)"
+    elif ar < 0.5:
+        results["page_ratio"] = f"⚠ very tall (ratio {ar:.2f}) — may be a panel not a page"
+    elif ar > 1.0:
+        results["page_ratio"] = f"⚠ landscape (ratio {ar:.2f}) — expected portrait for US comic"
+    else:
+        results["page_ratio"] = f"⚠ drift {ar_drift*100:.1f}% from expected US comic ratio"
+
+    # Resolution check
+    MIN_W, MIN_H = 1600, 2400
+    if w >= MIN_W and h >= MIN_H:
+        results["resolution"] = f"✓ {w}×{h} (print quality)"
+    elif w >= 800:
+        results["resolution"] = f"⚠ {w}×{h} (screen quality — ok for web, low for print)"
+    else:
+        results["resolution"] = f"✗ {w}×{h} (too low — will look bad at any size)"
+
+    # Color check — mostly grey/white/black suggests a template/placeholder page
+    rgb   = img.convert("RGB")
+    r, g, b = [list(rgb.getdata(band)) for band in range(3)]
+    avg_r = sum(r) / len(r)
+    avg_g = sum(g) / len(g)
+    avg_b = sum(b) / len(b)
+    color_var = abs(avg_r - avg_g) + abs(avg_g - avg_b) + abs(avg_r - avg_b)
+    if color_var < 10:
+        results["color"] = f"⚠ very low color variation ({color_var:.1f}) — may be mostly greyscale or blank"
+    else:
+        results["color"] = f"✓ color present (channel variance {color_var:.1f})"
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Vision QA prompt
+# ---------------------------------------------------------------------------
+
+FULL_PROMPT = """
+You are a professional comic book editor reviewing AI-generated comic pages.
+Analyze this image and give a CONCISE structured QA report covering:
+
+1. PANEL LAYOUT
+   - Are panels different sizes (good) or all equal (grid = bad)?
+   - Does the layout guide the eye like a real comic?
+   - Any panels that are cramped, too small, or oddly shaped?
+
+2. ASPECT RATIO / STRETCHING
+   - Does the character or any object look stretched horizontally or vertically?
+   - Do people look like normal human proportions?
+
+3. CHARACTER CONSISTENCY
+   - Does the main character look like the SAME person in every panel?
+   - Note any major face/body changes between panels.
+
+4. ART STYLE CONSISTENCY
+   - Does the art style (line weight, coloring, shading) stay consistent across panels?
+   - Any panels that look like a completely different artist drew them?
+
+5. TEXT / CAPTIONS
+   - Are the black caption boxes readable?
+   - Is any text in the panels garbled or cut off?
+
+6. OVERALL SCORE
+   Rate each category: PASS / WARN / FAIL
+   Give an overall score 1-10.
+
+Be direct and specific. Name panel numbers. No fluff.
+"""
+
+SHORT_PROMPT = """
+Comic page QA — brief report only:
+- Panel layout: equal grid (bad) or varied (good)?
+- Stretching: any objects/people look distorted?
+- Character: same face across panels?
+- Art style: consistent across panels?
+- Score: 1-10
+
+2-3 sentences total. Be blunt.
+"""
+
+
+def vision_check(path: str, fast: bool = False, compare_paths: List[str] = None) -> str:
+    """Run Gemini vision QA on one (or multiple) comic pages."""
+    genai = load_gemini()
+
+    try:
+        model = genai.GenerativeModel("gemini-2.0-flash")
+    except Exception:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+
+    images = []
+    for p in ([path] + (compare_paths or [])):
+        try:
+            images.append(Image.open(p))
+        except Exception as e:
+            print(f"Could not open {p}: {e}", file=sys.stderr)
+
+    if not images:
+        return "No images could be loaded."
+
+    prompt = SHORT_PROMPT if fast else FULL_PROMPT
+
+    if len(images) > 1:
+        prompt += (
+            f"\n\nNOTE: You have {len(images)} pages. "
+            "Also comment on: does character look consistent ACROSS pages?"
+        )
+
+    content = [prompt] + images
+    try:
+        response = model.generate_content(content)
+        return response.text
+    except Exception as e:
+        return f"Vision check failed: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="comic-qa",
+        description="Visual quality check for comic pages using Gemini vision.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  comic-qa fixed-p1.png
+  comic-qa fixed-p1.png fixed-p2.png     # check both + cross-page consistency
+  comic-qa *.png --fast                   # quick score, no detail
+  comic-qa page.png --json               # machine-readable output
+        """,
+    )
+    parser.add_argument("images", nargs="+", help="Comic page PNG files to check")
+    parser.add_argument("--fast",    action="store_true",  help="Short report only")
+    parser.add_argument("--json",    action="store_true",  help="Include pixel metrics as JSON")
+    parser.add_argument("--no-vision", action="store_true",help="Pixel checks only, skip Gemini vision")
+    parser.add_argument("--verbose", "-v", action="store_true")
+
+    args = parser.parse_args()
+
+    paths = []
+    for pattern in args.images:
+        p = Path(pattern)
+        if p.exists():
+            paths.append(str(p))
+        else:
+            import glob
+            expanded = glob.glob(pattern)
+            if expanded:
+                paths.extend(sorted(expanded))
+            else:
+                print(f"Warning: {pattern} not found", file=sys.stderr)
+
+    if not paths:
+        print("No valid image files found.", file=sys.stderr)
+        sys.exit(1)
+
+    # ---- Pixel checks ----
+    print("=" * 60)
+    print("PIXEL CHECKS")
+    print("=" * 60)
+    all_pixel = []
+    for path in paths:
+        checks = pixel_checks(path)
+        all_pixel.append(checks)
+        print(f"\n{Path(path).name}:")
+        for k, v in checks.items():
+            if k not in ("path",):
+                print(f"  {k:<18} {v}")
+
+    if args.json:
+        print("\n" + json.dumps(all_pixel, indent=2))
+
+    if args.no_vision:
+        return
+
+    # ---- Vision QA ----
+    print("\n" + "=" * 60)
+    print("VISION QA  (Gemini)")
+    print("=" * 60)
+
+    if len(paths) == 1:
+        report = vision_check(paths[0], fast=args.fast)
+        print(f"\n{report}")
+    else:
+        # Multi-page: check first page with others as compare context
+        print(f"\nChecking {len(paths)} pages together…\n")
+        report = vision_check(paths[0], fast=args.fast, compare_paths=paths[1:])
+        print(report)
+
+    print("\n" + "=" * 60)
+
+
+if __name__ == "__main__":
+    main()

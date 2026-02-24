@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""
+crabby-express — CLI expression generator for Crabby.
+
+Generates comic-style portraits of Mike with specified expressions.
+Wraps the PortraitGenerator from the youtube-channel project with
+baked-in defaults for dead-simple invocation.
+
+Usage:
+    crabby-express happy
+    crabby-express --prompt "winking with finger guns"
+    crabby-express --list
+    crabby-express happy --cache
+"""
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import sys
+import warnings
+from pathlib import Path
+
+# Suppress noisy deprecation warnings from google libs on Python 3.9
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*urllib3.*")
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+CONFIG_PATH = Path.home() / "Desktop" / "crabby" / "config.json"
+
+
+def load_config():
+    """Load config from ~/.crabby/config.json."""
+    if not CONFIG_PATH.exists():
+        print(f"Config not found: {CONFIG_PATH}", file=sys.stderr)
+        sys.exit(1)
+    with open(CONFIG_PATH) as f:
+        cfg = json.load(f)
+    # Expand ~ in output_dir
+    cfg["output_dir"] = str(Path(cfg["output_dir"]).expanduser())
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Logging — everything to stderr so stdout stays clean for the output path
+# ---------------------------------------------------------------------------
+
+def setup_logging():
+    """Redirect all logging to stderr."""
+    root = logging.getLogger()
+    root.handlers.clear()
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S"))
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    setup_logging()
+    config = load_config()
+
+    # Load .env before importing generate_portrait (it calls load_dotenv() at import time)
+    env_file = config.get("env_file", "")
+    if env_file and Path(env_file).exists():
+        from dotenv import load_dotenv
+        load_dotenv(env_file, override=True)
+
+    # Add the generator project to sys.path and import
+    generator_path = config.get("generator_path", "")
+    if generator_path not in sys.path:
+        sys.path.insert(0, generator_path)
+
+    try:
+        from generate_portrait import PortraitGenerator, EXPRESSIONS
+    except ImportError as e:
+        print(f"Failed to import PortraitGenerator: {e}", file=sys.stderr)
+        print(f"Ensure generator_path in config points to the youtube-channel project", file=sys.stderr)
+        sys.exit(1)
+
+    # -----------------------------------------------------------------------
+    # Argument parsing
+    # -----------------------------------------------------------------------
+
+    parser = argparse.ArgumentParser(
+        prog="crabby-express",
+        description="Generate comic-style expression portraits for Crabby.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n"
+               "  crabby-express happy\n"
+               "  crabby-express --prompt 'winking with finger guns'\n"
+               "  crabby-express happy --cache\n"
+               "  crabby-express --list\n",
+    )
+    parser.add_argument(
+        "expression",
+        nargs="?",
+        choices=list(EXPRESSIONS.keys()),
+        metavar="EXPRESSION",
+        help="Predefined expression name (use --list to see all)",
+    )
+    parser.add_argument(
+        "--expression", "-e",
+        dest="expression_flag",
+        choices=list(EXPRESSIONS.keys()),
+        metavar="EXPR",
+        help="Predefined expression (alternative to positional)",
+    )
+    parser.add_argument("--prompt", "-p", help="Custom prompt (overrides expression)")
+    parser.add_argument("--list", "-l", action="store_true", help="List available expressions and exit")
+    parser.add_argument("--cache", action="store_true", help="Use cached file if it exists (skip regeneration)")
+    parser.add_argument("--fresh", action="store_true", help="Force regeneration (default behavior)")
+    parser.add_argument("--output", "-o", help="Override output file path")
+
+    args = parser.parse_args()
+
+    # --list: print expressions and exit
+    if args.list:
+        for name in sorted(EXPRESSIONS.keys()):
+            print(f"  {name:<16} {EXPRESSIONS[name]}")
+        sys.exit(0)
+
+    # Resolve expression: positional > --expression flag > --prompt
+    expr_name = args.expression or args.expression_flag
+    if args.prompt:
+        prompt_text = args.prompt
+        # Hash-based filename for custom prompts
+        prompt_hash = hashlib.sha256(args.prompt.encode()).hexdigest()[:12]
+        output_filename = f"custom_{prompt_hash}.png"
+        expr_name = None  # clear so we don't confuse caching logic
+    elif expr_name:
+        prompt_text = EXPRESSIONS[expr_name]
+        output_filename = f"{expr_name}.png"
+    else:
+        parser.error("Provide an expression name or --prompt. Use --list to see options.")
+
+    # -----------------------------------------------------------------------
+    # Output path
+    # -----------------------------------------------------------------------
+
+    output_dir = Path(config["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        output_path = output_dir / output_filename
+
+    # -----------------------------------------------------------------------
+    # Cache check
+    # -----------------------------------------------------------------------
+
+    if args.cache and output_path.exists():
+        print(str(output_path))
+        sys.exit(0)
+
+    # If regenerating (default), remove existing file so PortraitGenerator
+    # doesn't auto-increment the filename
+    if output_path.exists():
+        output_path.unlink()
+
+    # -----------------------------------------------------------------------
+    # Validate inputs
+    # -----------------------------------------------------------------------
+
+    reference = config.get("reference", "")
+    styles = config.get("styles", [])
+
+    if not Path(reference).exists():
+        print(f"Reference image not found: {reference}", file=sys.stderr)
+        sys.exit(1)
+
+    missing = [s for s in styles if not Path(s).exists()]
+    if missing:
+        for m in missing:
+            print(f"Style image not found: {m}", file=sys.stderr)
+        sys.exit(1)
+
+    # -----------------------------------------------------------------------
+    # Generate
+    # -----------------------------------------------------------------------
+
+    try:
+        generator = PortraitGenerator()
+        # Override output directory to our expressions folder
+        generator.output_dir = output_path.parent
+
+        print(f"Generating '{expr_name or 'custom'}' expression...", file=sys.stderr)
+
+        result = generator.generate_portrait(
+            person_image_path=reference,
+            style_image_paths=styles,
+            prompt=prompt_text,
+            output_name=output_path.name,
+        )
+
+        if result:
+            # The generator may have saved to a different path — ensure it's at our target
+            result_path = Path(result)
+            if result_path.resolve() != output_path.resolve() and result_path.exists():
+                result_path.rename(output_path)
+            print(str(output_path))
+            sys.exit(0)
+        else:
+            print("Portrait generation failed — no image returned", file=sys.stderr)
+            sys.exit(1)
+
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

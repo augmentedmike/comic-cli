@@ -1,0 +1,883 @@
+#!/usr/bin/env python3
+"""
+comic-blog — Comic book blog generator powered by Nano Banana (kie.ai).
+
+Turns daily notes, ideas, or a free topic into a full comic-format blog post.
+No reference photos required — everything driven by text prompts.
+
+API: kie.ai  (wraps Nano Banana = Gemini 2.5 Flash image model)
+Auth: KIE_API_KEY env var, or set in ~/.config/comic-blog/config.json
+
+Usage:
+    comic-blog --notes  memory/2026-02-22-notes.md --title "My Monday"
+    comic-blog --topic  "Building a SaaS from scratch in one day"
+    comic-blog --notes  notes.md --pages 2 --style noir
+    comic-blog --config          # print / create starter config
+    comic-blog --list-layouts
+    comic-blog --list-styles
+"""
+
+import argparse
+import base64
+import datetime
+import json
+import logging
+import os
+import re
+import sys
+import time
+import urllib.request
+import urllib.error
+import warnings
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+try:
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
+except ImportError:
+    print("Pillow required: pip install pillow", file=sys.stderr)
+    sys.exit(1)
+
+# ---------------------------------------------------------------------------
+# Standard US Comic Book page  @ 300 DPI
+# ---------------------------------------------------------------------------
+
+PAGE_W       = 1988
+PAGE_H       = 3075
+MARGIN       = 48
+GUTTER       = 18
+BORDER_W     = 4
+CAPTION_H    = 72
+
+BG_COLOR     = (255, 255, 255)
+BORDER_COLOR = (12,  12,  12 )
+CAPTION_BG   = (12,  12,  12 )
+CAPTION_FG   = (255, 255, 255)
+
+# ---------------------------------------------------------------------------
+# Layout system  (same as crabby-comic)
+# Layout = List of (row_height_weight, [col_weights])
+# ---------------------------------------------------------------------------
+
+Layout = List[Tuple[int, List[int]]]
+
+LAYOUTS: Dict[str, Layout] = {
+    "splash-1":   [(1, [1])],
+    "splash-2":   [(1, [1]), (1, [1])],
+    "spread-3":   [(1, [1]), (1, [1]), (1, [1])],
+    "grid-4":     [(1, [1, 1]), (1, [1, 1])],
+    "morning":    [(2, [1]), (1, [1, 1]), (1, [1, 1, 2])],
+    "afternoon":  [(1, [1, 2]), (2, [1]), (1, [2, 1]), (1, [1])],
+    "action-6":   [(1, [2, 1]), (1, [1, 1]), (1, [1, 2])],
+    "feature-6":  [(2, [1]), (1, [1, 1, 1]), (1, [1, 1])],
+    "dialogue-6": [(1, [2, 1]), (1, [1, 2]), (1, [2, 1])],
+    "story-7":    [(2, [1]), (1, [1, 1]), (1, [1, 2]), (1, [1, 1])],
+    "drama-8":    [(2, [1]), (1, [1, 1, 1]), (1, [2, 1]), (1, [1, 1])],
+    "feature-5":  [(2, [1]), (1, [1, 1]), (1, [1, 1])],
+    "classic-4":  [(1, [2, 1]), (1, [1, 2])],
+    "grid-9":     [(1, [1, 1, 1]), (1, [1, 1, 1]), (1, [1, 1, 1])],
+}
+
+_CINEMATIC_DEFAULTS: Dict[int, str] = {
+    1: "splash-1", 2: "splash-2", 3: "spread-3", 4: "classic-4",
+    5: "feature-5", 6: "morning", 7: "story-7", 8: "drama-8", 9: "grid-9",
+}
+
+
+def count_panels(layout: Layout) -> int:
+    return sum(len(cols) for _, cols in layout)
+
+
+def compute_panel_rects(layout: Layout) -> List[Tuple[int, int, int, int]]:
+    content_w = PAGE_W - 2 * MARGIN
+    content_h = PAGE_H - 2 * MARGIN
+    num_rows  = len(layout)
+    gutter_h  = GUTTER * (num_rows - 1)
+    avail_h   = content_h - gutter_h
+    total_rw  = sum(rh for rh, _ in layout)
+    row_heights = [int(avail_h * rh / total_rw) for rh, _ in layout]
+
+    rects: List[Tuple[int, int, int, int]] = []
+    y = MARGIN
+    for idx, (_, cols) in enumerate(layout):
+        rh        = row_heights[idx]
+        total_cw  = sum(cols)
+        avail_w   = content_w - GUTTER * (len(cols) - 1)
+        x = MARGIN
+        for cw in cols:
+            pw = int(avail_w * cw / total_cw)
+            rects.append((x, y, pw, rh))
+            x += pw + GUTTER
+        y += rh + GUTTER
+    return rects
+
+
+def resolve_layout(n: int, hint: Optional[str] = None) -> Layout:
+    if hint:
+        if hint in LAYOUTS:
+            return LAYOUTS[hint]
+        # try legacy simple format "1,2,2"
+        try:
+            counts = [int(x) for x in hint.split(",")]
+            return [(1, [1] * c) for c in counts]
+        except ValueError:
+            pass
+    name = _CINEMATIC_DEFAULTS.get(n)
+    if name:
+        return LAYOUTS[name]
+    rows = [(1, [1, 1])] * (n // 2)
+    if n % 2:
+        rows.append((1, [1]))
+    return rows
+
+# ---------------------------------------------------------------------------
+# Art styles
+# ---------------------------------------------------------------------------
+
+STYLES: Dict[str, str] = {
+    "comic":      "American comic book art style, bold ink outlines, flat halftone colors, cross-hatch shadows, vibrant palette",
+    "manga":      "Japanese manga style, clean ink lines, screentone shading, high contrast black and white",
+    "noir":       "Film noir comic style, stark black and white, heavy shadow, dramatic lighting, noir atmosphere",
+    "retro":      "Silver age comic book style, vintage halftone dots, primary colors, Ben-Day dots, 1960s print aesthetic",
+    "watercolor": "Watercolor comic style, loose ink lines, soft washes, textured paper, painterly feel",
+    "sketch":     "Pencil sketch comic style, raw pencil lines, rough shading, sketchbook feel",
+    "pop-art":    "Roy Lichtenstein pop art style, Ben-Day dots, bold outlines, primary colors, onomatopoeia effects",
+}
+
+DEFAULT_STYLE = "comic"
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+CONFIG_DIR  = Path.home() / ".config" / "comic-blog"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+DEFAULT_CONFIG = {
+    "character": (
+        "Crabby, a sharp-witted tech entrepreneur — bald with a dark beard and glasses, "
+        "wearing a plain t-shirt, confident and expressive"
+    ),
+    "style": DEFAULT_STYLE,
+    "output_dir": str(Path.home() / "Desktop" / "comic-blog"),
+    "model": "google/nano-banana",
+}
+
+
+def load_config() -> Dict:
+    cfg = dict(DEFAULT_CONFIG)
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE) as f:
+            cfg.update(json.load(f))
+    # Allow env override
+    api_key = os.getenv("KIE_API_KEY") or cfg.get("kie_api_key", "")
+    cfg["kie_api_key"] = api_key
+    return cfg
+
+
+def save_config(cfg: Dict):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def setup_logging(verbose: bool = False):
+    root = logging.getLogger()
+    root.handlers.clear()
+    h = logging.StreamHandler(sys.stderr)
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S"))
+    root.addHandler(h)
+    root.setLevel(logging.DEBUG if verbose else logging.INFO)
+
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Nano Banana / kie.ai client
+# ---------------------------------------------------------------------------
+
+KIE_BASE    = "https://api.kie.ai"
+CREATE_URL  = f"{KIE_BASE}/api/v1/jobs/createTask"
+POLL_URL    = f"{KIE_BASE}/api/v1/jobs/recordInfo"
+
+
+def _kie_request(method: str, url: str, api_key: str, body: Optional[Dict] = None, params: Optional[Dict] = None) -> Dict:
+    """Minimal HTTP client using stdlib urllib (no extra deps)."""
+    if params:
+        qs = "&".join(f"{k}={v}" for k, v in params.items())
+        url = f"{url}?{qs}"
+    data = json.dumps(body).encode() if body else None
+    req  = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {api_key}")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode()
+        raise RuntimeError(f"HTTP {e.code}: {body_text}") from e
+
+
+def create_task(api_key: str, prompt: str, model: str, image_size: str, output_format: str = "png") -> str:
+    """Submit a generation task. Returns task_id."""
+    payload = {
+        "model": model,
+        "input": {
+            "prompt":        prompt,
+            "output_format": output_format,
+            "image_size":    image_size,
+        },
+    }
+    result = _kie_request("POST", CREATE_URL, api_key, body=payload)
+    if result.get("code") != 200:
+        raise RuntimeError(f"Task creation failed: {result}")
+    task_id = result["data"].get("taskId") or result["data"].get("task_id")
+    if not task_id:
+        raise RuntimeError(f"No task_id in response: {result}")
+    return task_id
+
+
+def poll_task(api_key: str, task_id: str, timeout: int = 120, interval: int = 4) -> str:
+    """Poll until task completes. Returns URL of generated image."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = _kie_request("GET", POLL_URL, api_key, params={"taskId": task_id})
+        if result.get("code") != 200:
+            raise RuntimeError(f"Poll failed: {result}")
+        data  = result["data"]
+        state = data.get("state", "")
+        if state == "success":
+            result_json = json.loads(data.get("resultJson", "{}"))
+            urls = result_json.get("resultUrls", [])
+            if not urls:
+                raise RuntimeError(f"No resultUrls in completed task: {data}")
+            return urls[0]
+        if state in ("failed", "error"):
+            raise RuntimeError(f"Task failed: {data.get('failMsg', 'unknown error')}")
+        logger.debug(f"  Task {task_id}: {state} — waiting {interval}s…")
+        time.sleep(interval)
+    raise TimeoutError(f"Task {task_id} did not complete in {timeout}s")
+
+
+def download_image(url: str, dest: Path):
+    """Download an image URL to dest path."""
+    req = urllib.request.Request(url, headers={"User-Agent": "comic-blog/1.0"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        dest.write_bytes(resp.read())
+
+# ---------------------------------------------------------------------------
+# Panel size selection based on layout position
+# ---------------------------------------------------------------------------
+
+_PANEL_SIZE_MAP: Dict[str, str] = {
+    # width_fraction → aspect ratio for API
+    "wide":    "16:9",
+    "square":  "1:1",
+    "portrait":"3:4",
+    "standard":"4:3",
+}
+
+
+def panel_aspect(w: int, h: int) -> str:
+    """Pick the best Nano Banana image_size for a panel of given pixel dims."""
+    ratio = w / h
+    if ratio >= 1.6:
+        return "16:9"
+    if ratio >= 1.1:
+        return "4:3"
+    if ratio <= 0.7:
+        return "3:4"
+    return "1:1"
+
+# ---------------------------------------------------------------------------
+# Prompt builder
+# ---------------------------------------------------------------------------
+
+def build_panel_prompt(scene: Dict, character: str, style_desc: str) -> str:
+    """Build a complete Nano Banana prompt for a single comic panel."""
+    caption  = scene.get("caption", "")
+    custom   = scene.get("prompt", "")
+    time_str = scene.get("time", "")
+
+    if custom:
+        scene_text = custom
+    else:
+        scene_text = caption
+
+    time_note = f" at {time_str}," if time_str else ""
+
+    return (
+        f"Comic book panel scene{time_note} featuring {character}. "
+        f"Scene: {scene_text}. "
+        f"{style_desc}. "
+        "Full environment visible — desk, room, props that match the scene. "
+        "Cinematic panel composition, clean readable framing."
+    )
+
+# ---------------------------------------------------------------------------
+# Frame generator (Nano Banana)
+# ---------------------------------------------------------------------------
+
+def generate_frames_nana(
+    scenes: List[Dict],
+    panel_rects: List[Tuple[int, int, int, int]],
+    config: Dict,
+    output_dir: Path,
+    cache: bool = False,
+) -> List[Optional[str]]:
+    api_key   = config.get("kie_api_key", "")
+    if not api_key:
+        print(
+            "KIE_API_KEY not set.\n"
+            "  Get a free key at https://kie.ai/api-key\n"
+            "  Then run: export KIE_API_KEY=your_key\n"
+            "  Or add it to ~/.config/comic-blog/config.json",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    character  = config.get("character", DEFAULT_CONFIG["character"])
+    style_name = config.get("style", DEFAULT_STYLE)
+    style_desc = STYLES.get(style_name, STYLES[DEFAULT_STYLE])
+    model      = config.get("model", DEFAULT_CONFIG["model"])
+    paths: List[Optional[str]] = []
+
+    for i, (scene, rect) in enumerate(zip(scenes, panel_rects), 1):
+        sid   = scene.get("id", i)
+        fname = f"panel_{sid:02d}.png"
+        out   = output_dir / fname
+
+        if cache and out.exists():
+            logger.info(f"[{i}/{len(scenes)}] Panel {sid}: cached ✓")
+            paths.append(str(out))
+            continue
+
+        prompt     = build_panel_prompt(scene, character, style_desc)
+        _, _, pw, ph = rect
+        img_size   = panel_aspect(pw, ph - CAPTION_H)
+
+        logger.info(f"[{i}/{len(scenes)}] Panel {sid} [{img_size}] — {scene.get('caption','')[:55]}…")
+        logger.debug(f"  Prompt: {prompt[:120]}…")
+
+        try:
+            task_id = create_task(api_key, prompt, model, img_size)
+            logger.debug(f"  task_id: {task_id}")
+            img_url = poll_task(api_key, task_id, timeout=180, interval=5)
+            download_image(img_url, out)
+            logger.info(f"  ✓ saved {fname}")
+            paths.append(str(out))
+        except Exception as e:
+            logger.warning(f"  ✗ Panel {sid} failed: {e}")
+            paths.append(None)
+
+    return paths
+
+# ---------------------------------------------------------------------------
+# Compositor  (aspect-ratio-correct crop-to-fill)
+# ---------------------------------------------------------------------------
+
+def get_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
+    candidates = []
+    if bold:
+        candidates += [
+            "/System/Library/Fonts/Supplemental/Comic Sans MS Bold.ttf",
+            "/Library/Fonts/Arial Bold.ttf",
+        ]
+    candidates += [
+        "/System/Library/Fonts/Supplemental/Comic Sans MS.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/SFNSText.ttf",
+        "/Library/Fonts/Arial.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+
+def draw_wrapped(draw, text, font, x, y, max_w, max_h, color):
+    words, lines, cur = text.split(), [], ""
+    for word in words:
+        test = (cur + " " + word).strip()
+        if draw.textbbox((0, 0), test, font=font)[2] <= max_w:
+            cur = test
+        else:
+            if cur: lines.append(cur)
+            cur = word
+    if cur: lines.append(cur)
+    lh = (font.size if hasattr(font, "size") else 16) + 5
+    for i, line in enumerate(lines):
+        if i * lh >= max_h: break
+        draw.text((x, y + i * lh), line, font=font, fill=color)
+
+
+def composite_page(
+    frame_paths: List[Optional[str]],
+    panel_rects: List[Tuple[int, int, int, int]],
+    captions:    List[str],
+    output_path: str,
+    title:       Optional[str] = None,
+) -> str:
+    page  = Image.new("RGB", (PAGE_W, PAGE_H), BG_COLOR)
+    draw  = ImageDraw.Draw(page)
+    c_fnt = get_font(22)
+    t_fnt = get_font(38, bold=True)
+    n_fnt = get_font(18)
+
+    if title:
+        draw.text((MARGIN, 10), title.upper(), font=t_fnt, fill=(20, 20, 20))
+
+    for i, (rect, fpath, cap) in enumerate(zip(panel_rects, frame_paths, captions)):
+        x, y, w, h = rect
+        draw.rectangle([x - BORDER_W, y - BORDER_W, x + w + BORDER_W, y + h + BORDER_W],
+                       fill=BORDER_COLOR)
+        content_h = h - CAPTION_H
+
+        if fpath and Path(fpath).exists():
+            try:
+                frame = Image.open(fpath).convert("RGB")
+                # Crop-to-fill preserves aspect ratio — no stretching
+                frame = ImageOps.fit(frame, (w, content_h), Image.LANCZOS)
+                page.paste(frame, (x, y))
+            except Exception as e:
+                logger.warning(f"Panel {i+1}: {e}")
+                _placeholder(draw, x, y, w, content_h, i + 1, n_fnt)
+        else:
+            _placeholder(draw, x, y, w, content_h, i + 1, n_fnt)
+
+        cap_y = y + content_h
+        draw.rectangle([x, cap_y, x + w, y + h], fill=CAPTION_BG)
+        if cap:
+            draw_wrapped(draw, cap, c_fnt, x + 10, cap_y + 10, w - 20, CAPTION_H - 20, CAPTION_FG)
+        draw.text((x + 8, y + 6), str(i + 1), font=n_fnt, fill=(220, 220, 220))
+
+    page.save(output_path, "PNG", dpi=(300, 300))
+    logger.info(f"✓ Page saved → {output_path}")
+    return output_path
+
+
+def _placeholder(draw, x, y, w, h, num, font):
+    draw.rectangle([x, y, x + w, y + h], fill=(210, 210, 210))
+    draw.text((x + w // 2 - 20, y + h // 2 - 10), f"Panel {num}", font=font, fill=(120, 120, 120))
+
+# ---------------------------------------------------------------------------
+# Notes parser  (HH:MM | text lines)
+# ---------------------------------------------------------------------------
+
+NOTE_RE = re.compile(r"^(\d{2}:\d{2})\s*\|\s*(.+)$")
+PRIORITY_PATS = [
+    re.compile(r"\[CLIENT CLOSED[^\]]*\]"),
+    re.compile(r"\[POTENTIAL CLOSE[^\]]*\]"),
+    re.compile(r"\[PIPELINE[^\]]*\]"),
+    re.compile(r"\[LEAD[^\]]*\]"),
+]
+
+
+def parse_notes(path: str) -> List[Dict]:
+    entries = []
+    with open(path) as f:
+        for line in f:
+            m = NOTE_RE.match(line.strip())
+            if m:
+                entries.append({"time": m.group(1), "text": m.group(2).strip()})
+    return entries
+
+
+def is_priority(text: str) -> bool:
+    return any(p.search(text) for p in PRIORITY_PATS)
+
+
+def auto_select(entries: List[Dict], n: int) -> List[Dict]:
+    tier1 = [entries[0]] if entries else []
+    if len(entries) > 1: tier1.append(entries[-1])
+    tier2 = [e for e in entries if is_priority(e["text"])]
+    tier3 = [e for e in entries if e["text"].lower().startswith("idea:")]
+    tier4 = [e for e in entries if e not in tier1 + tier2 + tier3]
+    seen, ordered = set(), []
+    for e in tier1 + tier2 + tier3 + tier4:
+        if e["time"] not in seen and len(ordered) < n:
+            seen.add(e["time"]); ordered.append(e)
+    ordered.sort(key=lambda e: e["time"])
+    return ordered[:n]
+
+
+def entry_to_prompt(entry: Dict) -> str:
+    t = entry["text"].lower()
+    if "[client closed]" in t or is_priority(entry["text"]) and "closed" in t:
+        mood = "triumphant, fist pump, closed a deal"
+    elif is_priority(entry["text"]):
+        mood = "focused and intent, in a business negotiation"
+    elif "idea:" in t:
+        mood = "lightbulb moment, eyes wide, sudden realization"
+    elif any(w in t for w in ("fixed","merged","shipped","pushed")):
+        mood = "quietly satisfied, staring at screen, bug just squashed"
+    elif any(w in t for w in ("lunch","coffee","break")):
+        mood = "relaxed, off-duty, taking a breath"
+    elif "deep work" in t:
+        mood = "headphones on, fully locked in, flow state"
+    elif any(w in t for w in ("call","standup","meeting")):
+        mood = "on a call, attentive and engaged"
+    else:
+        mood = "focused and working at the desk"
+    text = entry["text"][:140]
+    return (
+        f"At {entry['time']}: {text}. "
+        f"Character expression and mood: {mood}. "
+        "Full scene — show the environment, relevant props, context."
+    )
+
+# ---------------------------------------------------------------------------
+# Blog HTML generator
+# ---------------------------------------------------------------------------
+
+def generate_html(
+    title: str,
+    date_str: str,
+    page_paths: List[str],
+    style: str = DEFAULT_STYLE,
+) -> str:
+    pages_html = "\n".join(
+        f'    <img src="{Path(p).name}" alt="Page {i+1}" class="comic-page">'
+        for i, p in enumerate(page_paths)
+    )
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{title}</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      background: #1a1a1a;
+      font-family: 'Comic Sans MS', 'Chalkboard SE', cursive, sans-serif;
+      color: #f0f0f0;
+      padding: 2rem 1rem;
+    }}
+    .post {{
+      max-width: 800px;
+      margin: 0 auto;
+    }}
+    header {{
+      text-align: center;
+      margin-bottom: 2rem;
+      border-bottom: 4px solid #fff;
+      padding-bottom: 1rem;
+    }}
+    h1 {{
+      font-size: 2.5rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #fff;
+      text-shadow: 3px 3px 0 #000;
+    }}
+    .date {{
+      font-size: 0.9rem;
+      color: #aaa;
+      margin-top: 0.5rem;
+    }}
+    .style-tag {{
+      display: inline-block;
+      background: #ffdd00;
+      color: #000;
+      font-size: 0.75rem;
+      font-weight: bold;
+      padding: 2px 8px;
+      margin-top: 0.5rem;
+      border: 2px solid #000;
+    }}
+    .comic-page {{
+      width: 100%;
+      display: block;
+      margin: 1rem 0;
+      border: 4px solid #000;
+      box-shadow: 6px 6px 0 #000;
+    }}
+    footer {{
+      text-align: center;
+      margin-top: 2rem;
+      color: #666;
+      font-size: 0.8rem;
+    }}
+  </style>
+</head>
+<body>
+  <div class="post">
+    <header>
+      <h1>{title}</h1>
+      <p class="date">{date_str}</p>
+      <span class="style-tag">{style.upper()} STYLE</span>
+    </header>
+    <main>
+{pages_html}
+    </main>
+    <footer>Generated with comic-blog · Powered by Nano Banana</footer>
+  </div>
+</body>
+</html>
+"""
+
+# ---------------------------------------------------------------------------
+# Spread compositing
+# ---------------------------------------------------------------------------
+
+def generate_spread(
+    scenes:      List[Dict],
+    frame_paths: List[Optional[str]],
+    n_pages:     int,
+    layout_hint: Optional[str],
+    output_dir:  Path,
+    datestamp:   str,
+    title:       Optional[str],
+    output_stem: Optional[str],
+) -> List[str]:
+    total      = len(scenes)
+    base, rem  = divmod(total, n_pages)
+    page_sizes = [base + (1 if i < rem else 0) for i in range(n_pages)]
+    out_paths: List[str] = []
+    cursor = 0
+    for pg_idx, pg_size in enumerate(page_sizes, 1):
+        pg_scenes  = scenes[cursor: cursor + pg_size]
+        pg_frames  = list(frame_paths[cursor: cursor + pg_size])
+        cursor    += pg_size
+
+        if layout_hint is None and n_pages == 2 and pg_size == 6:
+            hint = "morning" if pg_idx == 1 else "afternoon"
+        else:
+            hint = layout_hint
+
+        layout      = resolve_layout(pg_size, hint)
+        total_slots = count_panels(layout)
+
+        pg_captions = [s.get("caption", "") for s in pg_scenes]
+        while len(pg_frames)   < total_slots: pg_frames.append(None)
+        while len(pg_captions) < total_slots: pg_captions.append("")
+
+        if output_stem and n_pages == 1:
+            out_path = output_stem
+        elif output_stem:
+            stem = Path(output_stem)
+            out_path = str(stem.parent / f"{stem.stem}-p{pg_idx}{stem.suffix}")
+        else:
+            out_path = str(output_dir / f"comic-{datestamp}-p{pg_idx}.png")
+
+        pg_title = f"{title} — p.{pg_idx}" if title else None
+        logger.info(f"Compositing page {pg_idx}/{n_pages} ({hint or 'auto'}, {pg_size} panels)")
+        composite_page(
+            frame_paths=pg_frames,
+            panel_rects=compute_panel_rects(layout),
+            captions=pg_captions,
+            output_path=out_path,
+            title=pg_title,
+        )
+        out_paths.append(out_path)
+    return out_paths
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    setup_logging()
+
+    parser = argparse.ArgumentParser(
+        prog="comic-blog",
+        description="Generate a comic book blog post from notes or a topic.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  comic-blog --notes memory/2026-02-22-notes.md --title "My Monday"
+  comic-blog --notes notes.md --pages 2 --style noir
+  comic-blog --topic "Building a SaaS from scratch in 4 hours"
+  comic-blog --config
+  comic-blog --list-styles
+  comic-blog --list-layouts
+
+Requires KIE_API_KEY env var (get free key: https://kie.ai/api-key)
+Page spec: 6.625 x 10.25 in @ 300 DPI = 1988 x 3075 px
+        """,
+    )
+
+    src = parser.add_mutually_exclusive_group()
+    src.add_argument("--notes",  "-n", metavar="FILE.md",   help="Notes .md file (auto-extracts story frames)")
+    src.add_argument("--topic",  "-T", metavar="TOPIC",     help="Free-form topic — auto-generates a day-in-the-life script")
+    src.add_argument("--scenes", "-s", metavar="FILE.json", help="Pre-written scenes JSON file")
+
+    parser.add_argument("--title",    "-t", default=None,        help="Blog post title")
+    parser.add_argument("--pages",    "-p", type=int, default=1, help="Number of comic pages (default 1)")
+    parser.add_argument("--frames",   "-f", type=int, default=None,
+                        help="Panels per page when using --notes (default 6)")
+    parser.add_argument("--layout",   "-l", default=None,        help="Layout preset or row spec")
+    parser.add_argument("--style",    "-S", default=None,        choices=list(STYLES.keys()),
+                        help=f"Art style (default: {DEFAULT_STYLE})")
+    parser.add_argument("--output",   "-o", metavar="DIR",
+                        help="Output directory (default: ~/Desktop/comic-blog/YYYY-MM-DD/)")
+    parser.add_argument("--cache",          action="store_true", help="Reuse already-generated panels")
+    parser.add_argument("--no-html",        action="store_true", help="Skip HTML blog generation")
+    parser.add_argument("--list-styles",    action="store_true", help="List art styles and exit")
+    parser.add_argument("--list-layouts",   action="store_true", help="List layout presets and exit")
+    parser.add_argument("--config",         action="store_true", help="Show/create config and exit")
+    parser.add_argument("--verbose",  "-v", action="store_true")
+
+    args = parser.parse_args()
+    if args.verbose:
+        setup_logging(verbose=True)
+
+    # --list-styles
+    if args.list_styles:
+        print("\nArt styles:\n")
+        for name, desc in STYLES.items():
+            print(f"  {name:<14}  {desc[:70]}")
+        print()
+        sys.exit(0)
+
+    # --list-layouts
+    if args.list_layouts:
+        print("\nLayout presets:\n")
+        for name, layout in LAYOUTS.items():
+            print(f"  {name:<16}  {len(layout)} rows  {count_panels(layout)} panels")
+        print()
+        sys.exit(0)
+
+    # --config
+    if args.config:
+        cfg = load_config()
+        if not CONFIG_FILE.exists():
+            save_config({k: v for k, v in cfg.items() if k != "kie_api_key"})
+            print(f"Config created at {CONFIG_FILE}")
+        print(json.dumps({k: v for k, v in cfg.items() if k != "kie_api_key"}, indent=2))
+        if cfg.get("kie_api_key"):
+            print(f"\nKIE_API_KEY: ****{cfg['kie_api_key'][-4:]}")
+        else:
+            print("\nKIE_API_KEY: NOT SET  (export KIE_API_KEY=... or add to config)")
+        sys.exit(0)
+
+    if not args.notes and not args.topic and not args.scenes:
+        parser.error("Provide --notes, --topic, or --scenes.")
+
+    config = load_config()
+    if args.style:
+        config["style"] = args.style
+
+    n_pages      = max(1, args.pages)
+    panels_pp    = args.frames or 6
+    total_frames = panels_pp * n_pages
+
+    # ------------------------------------------------------------------
+    # Build scene list
+    # ------------------------------------------------------------------
+
+    if args.scenes:
+        with open(args.scenes) as f:
+            scenes = json.load(f)
+
+    elif args.notes:
+        entries = parse_notes(args.notes)
+        if not entries:
+            print(f"No 'HH:MM | text' entries found in {args.notes}", file=sys.stderr)
+            sys.exit(1)
+        selected = auto_select(entries, total_frames)
+        scenes = [
+            {"id": i+1, "time": e["time"], "caption": e["text"][:100], "prompt": entry_to_prompt(e)}
+            for i, e in enumerate(selected)
+        ]
+        logger.info(f"Selected {len(scenes)} frames across {n_pages} page(s):")
+        for s in scenes:
+            logger.info(f"  [{s['time']}] {s['caption'][:65]}")
+
+    else:
+        # --topic: generate a generic script
+        topic = args.topic
+        scenes = [
+            {"id": i+1, "caption": f"Scene {i+1} of: {topic}", "prompt":
+             f"Comic panel {i+1} of a story about: {topic}. Scene {i+1}, natural progression of events."}
+            for i in range(total_frames)
+        ]
+        logger.info(f"Generated {total_frames} generic frames for topic: {topic}")
+
+    # ------------------------------------------------------------------
+    # Output dir
+    # ------------------------------------------------------------------
+
+    datestamp  = datetime.date.today().isoformat()
+    title      = args.title or (args.topic or "comic") [:60]
+    slug       = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+
+    if args.output:
+        output_dir = Path(args.output)
+    else:
+        base = Path(config.get("output_dir", str(Path.home() / "Desktop" / "comic-blog")))
+        output_dir = base / f"{datestamp}-{slug}"
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Output dir: {output_dir}")
+
+    # ------------------------------------------------------------------
+    # Generate all panels
+    # ------------------------------------------------------------------
+
+    # Pre-compute panel rects for the full page set (for aspect hints)
+    # Use first-page layout to get representative rects for generation
+    sample_layout = resolve_layout(panels_pp, args.layout)
+    sample_rects  = compute_panel_rects(sample_layout)
+    # Repeat rects for multi-page (each page gets same layout shape)
+    all_rects = sample_rects * n_pages
+
+    frame_paths = generate_frames_nana(
+        scenes=scenes,
+        panel_rects=all_rects[:len(scenes)],
+        config=config,
+        output_dir=output_dir,
+        cache=args.cache,
+    )
+
+    # ------------------------------------------------------------------
+    # Composite pages
+    # ------------------------------------------------------------------
+
+    page_paths = generate_spread(
+        scenes=scenes,
+        frame_paths=frame_paths,
+        n_pages=n_pages,
+        layout_hint=args.layout,
+        output_dir=output_dir,
+        datestamp=datestamp,
+        title=title,
+        output_stem=None,
+    )
+
+    # ------------------------------------------------------------------
+    # Generate HTML blog post
+    # ------------------------------------------------------------------
+
+    if not args.no_html:
+        html_path = output_dir / "index.html"
+        html = generate_html(
+            title=title,
+            date_str=datestamp,
+            page_paths=page_paths,
+            style=config.get("style", DEFAULT_STYLE),
+        )
+        html_path.write_text(html)
+        logger.info(f"✓ Blog post → {html_path}")
+
+    # ------------------------------------------------------------------
+    # Output
+    # ------------------------------------------------------------------
+
+    for p in page_paths:
+        print(p)
+    if not args.no_html:
+        print(output_dir / "index.html")
+
+
+if __name__ == "__main__":
+    main()

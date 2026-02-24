@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+dist/
+build/
+.portrait_prefs.json
+generated_portraits/
+split/
+processed/
+debug/
+site/
