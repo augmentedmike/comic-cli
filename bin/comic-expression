@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-crabby-express — CLI expression generator for Crabby.
+comic-expression — CLI expression portrait generator.
 
-Generates comic-style portraits of Mike with specified expressions.
-Wraps the PortraitGenerator from the youtube-channel project with
-baked-in defaults for dead-simple invocation.
+Generates comic-style portraits with specified expressions.
+Wraps the PortraitGenerator with baked-in defaults for
+dead-simple invocation.
 
 Usage:
-    crabby-express happy
-    crabby-express --prompt "winking with finger guns"
-    crabby-express --list
-    crabby-express happy --cache
+    comic-expression happy
+    comic-expression --prompt "winking with finger guns"
+    comic-expression --list
+    comic-expression happy --cache
 """
 
 import argparse
@@ -90,14 +90,14 @@ def main():
     # -----------------------------------------------------------------------
 
     parser = argparse.ArgumentParser(
-        prog="crabby-express",
-        description="Generate comic-style expression portraits for Crabby.",
+        prog="comic-expression",
+        description="Generate comic-style expression portraits.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
-               "  crabby-express happy\n"
-               "  crabby-express --prompt 'winking with finger guns'\n"
-               "  crabby-express happy --cache\n"
-               "  crabby-express --list\n",
+               "  comic-expression happy\n"
+               "  comic-expression --prompt 'winking with finger guns'\n"
+               "  comic-expression happy --cache\n"
+               "  comic-expression --list\n",
     )
     parser.add_argument(
         "expression",
