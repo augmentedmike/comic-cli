@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-comic-expression — CLI expression portrait generator.
+comic-frame — CLI expression portrait generator.
 
 Generates comic-style portraits with specified expressions.
 Wraps the PortraitGenerator with baked-in defaults for
 dead-simple invocation.
 
 Usage:
-    comic-expression happy
-    comic-expression --prompt "winking with finger guns"
-    comic-expression --list
-    comic-expression happy --cache
+    comic-frame happy
+    comic-frame --prompt "winking with finger guns"
+    comic-frame --list
+    comic-frame happy --cache
 """
 
 import argparse
@@ -90,14 +90,14 @@ def main():
     # -----------------------------------------------------------------------
 
     parser = argparse.ArgumentParser(
-        prog="comic-expression",
+        prog="comic-frame",
         description="Generate comic-style expression portraits.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
-               "  comic-expression happy\n"
-               "  comic-expression --prompt 'winking with finger guns'\n"
-               "  comic-expression happy --cache\n"
-               "  comic-expression --list\n",
+               "  comic-frame happy\n"
+               "  comic-frame --prompt 'winking with finger guns'\n"
+               "  comic-frame happy --cache\n"
+               "  comic-frame --list\n",
     )
     parser.add_argument(
         "expression",
