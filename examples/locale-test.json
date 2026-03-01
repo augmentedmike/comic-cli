@@ -1,0 +1,17 @@
+[
+  {
+    "id": 1,
+    "caption": "The old lighthouse keeper climbs the spiral stairs one last time.",
+    "prompt": "Full comic book panel scene: This character is an old lighthouse keeper. Show him climbing a spiral staircase inside a weathered lighthouse at sunset, ocean visible through windows. He grips the railing, determined expression. Wide establishing shot. Bold ink outlines, warm sunset palette, cinematic framing. Full environment visible."
+  },
+  {
+    "id": 2,
+    "caption": "He strikes the match. The flame catches. The light returns to the sea.",
+    "prompt": "Full comic book panel scene: Close-up shot. This character strikes a match in darkness at the top of the lighthouse. The flame illuminates his determined face. Behind him, the massive lighthouse lens begins to glow amber. Show his hands, the match, and the lens. Dramatic chiaroscuro lighting, ink comic style, warm amber and deep shadows."
+  },
+  {
+    "id": 3,
+    "caption": "Far below, a ship finds its way home.",
+    "prompt": "Full comic book panel scene: Wide panoramic shot from high above. This character stands at the lighthouse lamp room window, small figure silhouetted against the bright beam. Below, the beam cuts through fog over dark ocean. A small fishing boat sails toward harbor, guided by the light. Night scene, deep blues and blacks with golden beam. Comic book art, cinematic composition."
+  }
+]

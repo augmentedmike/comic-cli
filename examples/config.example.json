@@ -1,0 +1,12 @@
+{
+  "reference": "/path/to/your/reference-photo.png",
+  "styles": [
+    "/path/to/style-image-1.jpeg",
+    "/path/to/style-image-2.jpeg",
+    "/path/to/style-image-3.jpeg"
+  ],
+  "emote_project": "~/development/comic-cli/user/youtube",
+  "output_dir": "~/Desktop/crabby/expressions",
+  "env_file": "/path/to/your/.env",
+  "generator_path": "/path/to/directory/containing/generate_portrait.py"
+}

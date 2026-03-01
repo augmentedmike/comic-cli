@@ -1,0 +1,671 @@
+#!/usr/bin/env python3
+"""
+comic-emote — Shaped emote generator for Stream Deck / OBS.
+
+Generates comic-style expression emotes with transparent shape masks
+(circle, diamond, hexagon, etc.) at multiple sizes.
+
+Uses character reference images as both person ref and style refs
+for consistent pop-art comic style output.
+
+Usage:
+    comic-emote happy
+    comic-emote witty --shape diamond
+    comic-emote sarcastic --shape hexagon --sizes 72,144,512
+    comic-emote --batch --shape circle
+    comic-emote --list
+    comic-emote --list-shapes
+    comic-emote --prompt "winking with finger guns" --shape rounded-square
+"""
+
+import argparse
+import hashlib
+import json
+import logging
+import math
+import os
+import sys
+import warnings
+from pathlib import Path
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*urllib3.*")
+
+# ---------------------------------------------------------------------------
+# Emote expressions — tuned for small sizes, tight crops
+# ---------------------------------------------------------------------------
+
+EMOTE_PROMPT_SUFFIX = (
+    "tight portrait crop, face fills the frame, pop-art comic style, "
+    "bold ink outlines, flat shading, solid vibrant background, no text"
+)
+
+EMOTE_EXPRESSIONS = {
+    # --- Core reactions ---
+    "happy":        "smart confident smile, warm eyes, self-assured",
+    "laughing":     "head thrown back, mouth open laughing, pure joy",
+    "love":         "heart eyes, dreamy smile, smitten expression",
+    "shocked":      "jaw dropped, eyes wide, stunned disbelief",
+    "angry":        "furrowed brows, clenched jaw, intense glare",
+    "calm":         "calm relaxed smile, friendly attentive eyes, listening warmly",
+    "exasperated":  "eyes wide with frustration, hands up in disbelief, fed up",
+    "facepalm":     "palm slapped against forehead, eyes closed, total exasperation",
+    "sarcastic":    "deadpan expression, subtle eye-roll, dry humor",
+    "dramatic":     "theatrical gasp, hand to chest, wide eyes",
+    # --- Stream personality ---
+    "witty":        "clever smirk, one eyebrow raised, knowing look",
+    "cool":         "sunglasses, slight smirk, effortlessly confident",
+    "smug":         "self-satisfied grin, chin up, I-told-you-so look",
+    "scheming":     "fingers steepled, mischievous grin, plotting something",
+    # --- Engineering moods ---
+    "thinking":     "hand on chin, eyes looking up, contemplative",
+    "focused":      "intense concentration, narrowed eyes, leaning forward",
+    "eureka":       "eyes lit up, finger pointing up, sudden realization",
+    "confused":     "squinting, head tilted, one eyebrow raised, puzzled",
+    "debugging":    "tired eyes, intense stare, hands on temples, laser focused",
+    "skeptical":    "arms crossed, one eyebrow raised high, not buying it",
+    # --- Energy states ---
+    "celebrating":  "fist pump, huge grin, triumphant victory pose",
+    "excited":      "wide eyes, huge grin, leaning forward with energy",
+    "nervous":      "biting lip, wide eyes, forced smile, sweating slightly",
+    "tired":        "heavy eyelids, slight slouch, coffee-needed expression",
+    "determined":   "set jaw, fierce eyes, ready to grind",
+    "proud":        "chin up, warm confident smile, arms crossed, satisfied",
+    # --- Audience engagement ---
+    "welcoming":    "open arms gesture, big warm smile, inviting",
+    "curious":      "leaning forward, eyes wide with interest, slight smile",
+    "mind-blown":   "hands on sides of head, mouth open, eyes huge, brain exploding",
+    "grateful":     "hand on heart, genuine warm smile, eyes slightly closed, thankful",
+}
+
+# ---------------------------------------------------------------------------
+# Expression → reference image mapping
+# ---------------------------------------------------------------------------
+
+EXPRESSION_REF_MAP = {
+    # Positive / energetic → laughing ref
+    "happy":        "mike-laughing.jpg",
+    "laughing":     "mike-laughing.jpg",
+    "celebrating":  "mike-laughing.jpg",
+    "love":         "mike-laughing.jpg",
+    "excited":      "mike-laughing.jpg",
+    "proud":        "mike-laughing.jpg",
+    "grateful":     "mike-laughing.jpg",
+    # Thoughtful / confident → explaining ref
+    "witty":        "mike-explaining.jpg",
+    "sarcastic":    "mike-explaining.jpg",
+    "thinking":     "mike-explaining.jpg",
+    "cool":         "mike-explaining.jpg",
+    "focused":      "mike-explaining.jpg",
+    "skeptical":    "mike-explaining.jpg",
+    "smug":         "mike-explaining.jpg",
+    "scheming":     "mike-explaining.jpg",
+    "determined":   "mike-explaining.jpg",
+    "curious":      "mike-explaining.jpg",
+    # Calm / welcoming → neutral ref
+    "calm":         "mike-neutral.jpg",
+    "welcoming":    "mike-neutral.jpg",
+    # Surprised / intense → shocked ref
+    "shocked":      "mike-shocked.jpg",
+    "dramatic":     "mike-shocked.jpg",
+    "angry":        "mike-shocked.jpg",
+    "eureka":       "mike-shocked.jpg",
+    "mind-blown":   "mike-shocked.jpg",
+    "confused":     "mike-shocked.jpg",
+    "nervous":      "mike-shocked.jpg",
+    # Exhausted → crying/exasperated refs
+    "exasperated":  "mike-exasperated.png",
+    "facepalm":     "mike-crying.jpg",
+    "tired":        "mike-crying.jpg",
+    "debugging":    "mike-crying.jpg",
+}
+
+DEFAULT_REF = "mike-neutral.jpg"
+
+# ---------------------------------------------------------------------------
+# Shape masks
+# ---------------------------------------------------------------------------
+
+SHAPES = {
+    "circle":          "Standard circle — clean, universal",
+    "diamond":         "Rotated square — bold, eye-catching",
+    "hexagon":         "Six-sided — tactical, gamer aesthetic",
+    "rounded-square":  "Soft corners — modern, app-icon style",
+    "octagon":         "Stop-sign shape — authoritative",
+    "shield":          "Wide top, pointed bottom — heroic",
+    "star":            "Five-pointed star — standout, reward style",
+}
+
+DEFAULT_SHAPE = "rounded-square"
+DEFAULT_SIZES = [72, 144, 512, 1024]
+SIZE_PRESETS = {
+    "streamdeck": [72, 144],
+    "obs":        [512, 1024],
+}
+MASTER_SIZE = 1024  # generate mask and crop at this size, then downscale
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+CONFIG_CANDIDATES = [
+    Path(__file__).resolve().parent.parent / "user" / "youtube" / "config.json",
+    Path.home() / ".config" / "comic-cli" / "config.json",
+    Path.home() / "Desktop" / "crabby" / "config.json",
+]
+
+
+def _find_config() -> Path:
+    for p in CONFIG_CANDIDATES:
+        if p.exists():
+            return p
+    return CONFIG_CANDIDATES[0]
+
+
+CONFIG_PATH = _find_config()
+
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        print(f"Config not found. Create one at: {CONFIG_CANDIDATES[0]}", file=sys.stderr)
+        print(f"  See examples/config.example.json for the format.", file=sys.stderr)
+        sys.exit(1)
+    with open(CONFIG_PATH) as f:
+        cfg = json.load(f)
+    cfg["output_dir"] = str(Path(cfg["output_dir"]).expanduser())
+    # Resolve emote_project relative to the config file's directory
+    config_dir = CONFIG_PATH.parent
+    if cfg.get("emote_project"):
+        cr = Path(cfg["emote_project"]).expanduser()
+        if not cr.is_absolute():
+            cr = config_dir / cr
+        cfg["emote_project"] = str(cr.resolve())
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def setup_logging():
+    root = logging.getLogger()
+    root.handlers.clear()
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S"))
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+
+# ---------------------------------------------------------------------------
+# Shape mask generators — all return L-mode images (white=opaque)
+# ---------------------------------------------------------------------------
+
+def _mask_circle(size):
+    from PIL import Image, ImageDraw
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).ellipse([0, 0, size - 1, size - 1], fill=255)
+    return mask
+
+
+def _mask_diamond(size):
+    from PIL import Image, ImageDraw
+    mask = Image.new("L", (size, size), 0)
+    mid = size // 2
+    pts = [(mid, 0), (size - 1, mid), (mid, size - 1), (0, mid)]
+    ImageDraw.Draw(mask).polygon(pts, fill=255)
+    return mask
+
+
+def _mask_hexagon(size):
+    from PIL import Image, ImageDraw
+    mask = Image.new("L", (size, size), 0)
+    cx, cy = size / 2, size / 2
+    r = size / 2
+    pts = []
+    for i in range(6):
+        angle = math.radians(60 * i - 90)
+        pts.append((cx + r * math.cos(angle), cy + r * math.sin(angle)))
+    ImageDraw.Draw(mask).polygon(pts, fill=255)
+    return mask
+
+
+def _mask_rounded_square(size):
+    from PIL import Image, ImageDraw
+    mask = Image.new("L", (size, size), 0)
+    radius = int(size * 0.2)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, size - 1, size - 1], radius=radius, fill=255)
+    return mask
+
+
+def _mask_octagon(size):
+    from PIL import Image, ImageDraw
+    mask = Image.new("L", (size, size), 0)
+    s = size - 1
+    d = int(s * 0.293)  # ~(1 - 1/sqrt(2)) * s
+    pts = [
+        (d, 0), (s - d, 0),
+        (s, d), (s, s - d),
+        (s - d, s), (d, s),
+        (0, s - d), (0, d),
+    ]
+    ImageDraw.Draw(mask).polygon(pts, fill=255)
+    return mask
+
+
+def _mask_shield(size):
+    from PIL import Image, ImageDraw
+    mask = Image.new("L", (size, size), 0)
+    s = size - 1
+    mid = s // 2
+    pts = [
+        (0, 0), (s, 0),
+        (s, int(s * 0.6)),
+        (mid, s),
+        (0, int(s * 0.6)),
+    ]
+    ImageDraw.Draw(mask).polygon(pts, fill=255)
+    return mask
+
+
+def _mask_star(size):
+    from PIL import Image, ImageDraw
+    mask = Image.new("L", (size, size), 0)
+    cx, cy = size / 2, size / 2
+    outer_r = size / 2
+    inner_r = size / 5
+    pts = []
+    for i in range(10):
+        angle = math.radians(36 * i - 90)
+        r = outer_r if i % 2 == 0 else inner_r
+        pts.append((cx + r * math.cos(angle), cy + r * math.sin(angle)))
+    ImageDraw.Draw(mask).polygon(pts, fill=255)
+    return mask
+
+
+SHAPE_GENERATORS = {
+    "circle":         _mask_circle,
+    "diamond":        _mask_diamond,
+    "hexagon":        _mask_hexagon,
+    "rounded-square": _mask_rounded_square,
+    "octagon":        _mask_octagon,
+    "shield":         _mask_shield,
+    "star":           _mask_star,
+}
+
+
+def generate_shape_mask(shape_name, size):
+    gen = SHAPE_GENERATORS.get(shape_name)
+    if gen is None:
+        raise ValueError(f"Unknown shape: {shape_name}. Choose from: {', '.join(SHAPES)}")
+    return gen(size)
+
+
+# ---------------------------------------------------------------------------
+# Character reference helpers
+# ---------------------------------------------------------------------------
+
+def resolve_character_refs(config, expression_name):
+    """Return (person_ref_path, style_ref_paths) from emote_project dir or legacy config."""
+    char_dir = config.get("emote_project", "")
+    if char_dir:
+        char_path = Path(char_dir).expanduser()
+        if not char_path.is_dir():
+            print(f"emote_project directory not found: {char_path}", file=sys.stderr)
+            sys.exit(1)
+
+        all_images = sorted(
+            p for p in char_path.iterdir()
+            if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp") and p.is_file()
+        )
+        if not all_images:
+            print(f"No images found in emote_project: {char_path}", file=sys.stderr)
+            sys.exit(1)
+
+        # Pick best person ref for this expression
+        ref_filename = EXPRESSION_REF_MAP.get(expression_name, DEFAULT_REF)
+        person_ref = char_path / ref_filename
+        if not person_ref.exists():
+            person_ref = all_images[0]  # fallback to first image
+
+        style_refs = [str(p) for p in all_images]
+        return str(person_ref), style_refs
+
+    # Legacy fallback
+    reference = config.get("reference", "")
+    styles = config.get("styles", [])
+    return reference, styles
+
+
+def load_style_config(config):
+    """Load style.json from emote_project dir if it exists."""
+    project_dir = config.get("emote_project", "")
+    if project_dir:
+        style_path = Path(project_dir) / "style.json"
+        if style_path.exists():
+            with open(style_path) as f:
+                return json.load(f)
+    return {}
+
+
+def resolve_bg_color(style_config, expression_name):
+    """Pick background color: expression map → cycle palette → None."""
+    bgs = style_config.get("backgrounds", {})
+    if expression_name and expression_name in bgs:
+        return bgs[expression_name]
+    palette = style_config.get("palette", [])
+    if palette and expression_name:
+        idx = hash(expression_name) % len(palette)
+        return palette[idx]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Post-processing
+# ---------------------------------------------------------------------------
+
+BORDER_W = 6  # border thickness as fraction of master size → 6px at 1024
+BORDER_COLOR = (20, 20, 20, 255)  # near-black ink
+
+
+def postprocess_emote(raw_path, shape_name, sizes, output_dir, base_name,
+                      save_raw=False, border=True):
+    """Crop to square, apply shape mask with comic-panel border, resize, save as transparent PNG."""
+    from PIL import Image, ImageDraw, ImageOps
+
+    raw = Image.open(raw_path)
+    square = ImageOps.fit(raw, (MASTER_SIZE, MASTER_SIZE), Image.LANCZOS)
+    square = square.convert("RGBA")
+
+    mask = generate_shape_mask(shape_name, MASTER_SIZE)
+    square.putalpha(mask)
+
+    # Draw comic-panel border inside the shape
+    if border:
+        border_w = max(4, MASTER_SIZE // 170)  # ~6px at 1024
+        # Create border by drawing shape outline on the RGBA image
+        border_mask = generate_shape_mask(shape_name, MASTER_SIZE)
+        inner_size = MASTER_SIZE - border_w * 2
+        inner_mask = generate_shape_mask(shape_name, inner_size)
+        # Paste inner mask centered onto a full-size black image to get the border ring
+        ring = Image.new("L", (MASTER_SIZE, MASTER_SIZE), 0)
+        ring.paste(border_mask, (0, 0))
+        inner_full = Image.new("L", (MASTER_SIZE, MASTER_SIZE), 0)
+        inner_full.paste(inner_mask, (border_w, border_w))
+        # Border ring = outer mask minus inner mask
+        import numpy as np
+        ring_arr = np.array(ring, dtype=np.int16) - np.array(inner_full, dtype=np.int16)
+        ring_arr = np.clip(ring_arr, 0, 255).astype(np.uint8)
+        # Draw border color where ring is opaque
+        border_layer = Image.new("RGBA", (MASTER_SIZE, MASTER_SIZE), BORDER_COLOR)
+        border_layer.putalpha(Image.fromarray(ring_arr))
+        square = Image.alpha_composite(square, border_layer)
+
+    emote_dir = output_dir / "emotes"
+    emote_dir.mkdir(parents=True, exist_ok=True)
+
+    if save_raw:
+        raw_dir = emote_dir / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        raw.save(raw_dir / f"{base_name}_raw.png")
+
+    saved = []
+    for sz in sizes:
+        resized = square.resize((sz, sz), Image.LANCZOS)
+        filename = f"{base_name}_{shape_name}_{sz}x{sz}.png"
+        out_path = emote_dir / filename
+        resized.save(out_path)
+        saved.append(str(out_path))
+
+    return saved
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    setup_logging()
+
+    # -------------------------------------------------------------------
+    # Argument parsing (before config load so --list/--list-shapes work)
+    # -------------------------------------------------------------------
+
+    parser = argparse.ArgumentParser(
+        prog="comic-emote",
+        description="Generate shaped emotes for Stream Deck / OBS.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n"
+               "  comic-emote happy\n"
+               "  comic-emote witty --shape diamond\n"
+               "  comic-emote sarcastic --shape hexagon --sizes 72,144,512\n"
+               "  comic-emote --batch --shape circle\n"
+               "  comic-emote --list\n"
+               "  comic-emote --list-shapes\n",
+    )
+    parser.add_argument(
+        "expression",
+        nargs="?",
+        choices=list(EMOTE_EXPRESSIONS.keys()),
+        metavar="EXPRESSION",
+        help="Emote expression name (use --list to see all)",
+    )
+    parser.add_argument("--prompt", "-p", help="Custom prompt (overrides expression)")
+    parser.add_argument(
+        "--shape", "-s",
+        default=DEFAULT_SHAPE,
+        choices=list(SHAPES.keys()),
+        metavar="SHAPE",
+        help=f"Shape mask (default: {DEFAULT_SHAPE}; use --list-shapes to see all)",
+    )
+    parser.add_argument(
+        "--sizes",
+        default=None,
+        help=f"Comma-separated output sizes in px (default: {','.join(map(str, DEFAULT_SIZES))})",
+    )
+    parser.add_argument(
+        "--preset",
+        choices=list(SIZE_PRESETS.keys()),
+        help="Size preset: streamdeck (72,144) or obs (512,1024)",
+    )
+    parser.add_argument("--batch", action="store_true", help="Generate all expressions")
+    parser.add_argument("--list", "-l", action="store_true", help="List available expressions and exit")
+    parser.add_argument("--list-shapes", action="store_true", help="List available shapes and exit")
+    parser.add_argument("--bg", default=None, help="Background color for the prompt (e.g. red, blue, yellow)")
+    parser.add_argument("--no-border", action="store_true", help="Skip comic-panel border")
+    parser.add_argument("--save-ref", action="store_true",
+                        help="Save raw generation back to emote_project dir as a reference image")
+    parser.add_argument("--raw", action="store_true", help="Also save the raw unmasked image")
+    parser.add_argument("--cache", action="store_true", help="Skip regeneration if output exists")
+    parser.add_argument("--output", "-o", help="Override output directory")
+
+    args = parser.parse_args()
+
+    # --list: print expressions and exit
+    if args.list:
+        print("Available emote expressions:\n")
+        for name in sorted(EMOTE_EXPRESSIONS.keys()):
+            print(f"  {name:<14} {EMOTE_EXPRESSIONS[name]}")
+        sys.exit(0)
+
+    # --list-shapes: print shapes and exit
+    if args.list_shapes:
+        print("Available shapes:\n")
+        for name, desc in SHAPES.items():
+            default = " (default)" if name == DEFAULT_SHAPE else ""
+            print(f"  {name:<16} {desc}{default}")
+        sys.exit(0)
+
+    # -------------------------------------------------------------------
+    # Load config (only needed for generation)
+    # -------------------------------------------------------------------
+
+    config = load_config()
+
+    # Load .env before importing generate_portrait
+    env_file = config.get("env_file", "")
+    if env_file and Path(env_file).exists():
+        from dotenv import load_dotenv
+        load_dotenv(env_file, override=True)
+
+    # Add generator project to sys.path
+    generator_path = config.get("generator_path", "")
+    if generator_path and generator_path not in sys.path:
+        sys.path.insert(0, generator_path)
+
+    try:
+        from generate_portrait import PortraitGenerator
+    except ImportError as e:
+        print(f"Failed to import PortraitGenerator: {e}", file=sys.stderr)
+        print(f"Ensure generator_path in config points to the project with generate_portrait.py", file=sys.stderr)
+        sys.exit(1)
+
+    # -------------------------------------------------------------------
+    # Resolve sizes
+    # -------------------------------------------------------------------
+
+    if args.preset:
+        sizes = SIZE_PRESETS[args.preset]
+    elif args.sizes:
+        try:
+            sizes = [int(s.strip()) for s in args.sizes.split(",")]
+        except ValueError:
+            parser.error("--sizes must be comma-separated integers (e.g. 72,144,512)")
+    else:
+        sizes = DEFAULT_SIZES
+
+    # -------------------------------------------------------------------
+    # Build list of expressions to generate
+    # -------------------------------------------------------------------
+
+    if args.batch:
+        expressions_to_gen = list(EMOTE_EXPRESSIONS.keys())
+    elif args.prompt:
+        expressions_to_gen = [None]  # custom prompt
+    elif args.expression:
+        expressions_to_gen = [args.expression]
+    else:
+        parser.error("Provide an expression name, --prompt, or --batch. Use --list to see options.")
+
+    # -------------------------------------------------------------------
+    # Output dir
+    # -------------------------------------------------------------------
+
+    output_dir = Path(args.output) if args.output else Path(config["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Temp dir for raw Gemini output
+    raw_gen_dir = output_dir / "emotes" / ".gen"
+    raw_gen_dir.mkdir(parents=True, exist_ok=True)
+
+    # -------------------------------------------------------------------
+    # Generate
+    # -------------------------------------------------------------------
+
+    style_config = load_style_config(config)
+    generator = None
+    all_outputs = []
+
+    for expr_name in expressions_to_gen:
+        if args.prompt and expr_name is None:
+            prompt_text = args.prompt
+            prompt_hash = hashlib.sha256(args.prompt.encode()).hexdigest()[:12]
+            base_name = f"custom_{prompt_hash}"
+            ref_expr = "happy"  # default ref for custom prompts
+        else:
+            prompt_text = EMOTE_EXPRESSIONS[expr_name]
+            base_name = expr_name
+            ref_expr = expr_name
+
+        suffix = EMOTE_PROMPT_SUFFIX
+        bg_color = args.bg or resolve_bg_color(style_config, expr_name or base_name)
+        if bg_color:
+            suffix = suffix.replace("solid vibrant background", f"solid {bg_color} background")
+        full_prompt = f"{prompt_text}, {suffix}"
+
+        # Cache check — look for the first expected output
+        first_expected = output_dir / "emotes" / f"{base_name}_{args.shape}_{sizes[0]}x{sizes[0]}.png"
+        if args.cache and first_expected.exists():
+            print(f"Cached: {base_name}", file=sys.stderr)
+            print(str(first_expected))
+            continue
+
+        # Resolve reference images
+        person_ref, style_refs = resolve_character_refs(config, ref_expr)
+
+        if not Path(person_ref).exists():
+            print(f"Reference image not found: {person_ref}", file=sys.stderr)
+            sys.exit(1)
+
+        missing = [s for s in style_refs if not Path(s).exists()]
+        if missing:
+            for m in missing:
+                print(f"Style image not found: {m}", file=sys.stderr)
+            sys.exit(1)
+
+        # Lazy-init generator
+        if generator is None:
+            try:
+                generator = PortraitGenerator()
+                generator.output_dir = raw_gen_dir
+            except Exception as e:
+                print(f"Error initializing generator: {e}", file=sys.stderr)
+                sys.exit(1)
+
+        # Generate raw portrait
+        raw_filename = f"{base_name}_raw.png"
+        raw_path = raw_gen_dir / raw_filename
+        if raw_path.exists():
+            raw_path.unlink()
+
+        print(f"Generating '{base_name}' emote...", file=sys.stderr)
+
+        try:
+            result = generator.generate_portrait(
+                person_image_path=person_ref,
+                style_image_paths=style_refs,
+                prompt=full_prompt,
+                output_name=raw_filename,
+            )
+        except Exception as e:
+            print(f"Error generating '{base_name}': {e}", file=sys.stderr)
+            if not args.batch:
+                sys.exit(1)
+            continue
+
+        if not result:
+            print(f"Generation failed for '{base_name}' — no image returned", file=sys.stderr)
+            if not args.batch:
+                sys.exit(1)
+            continue
+
+        result_path = Path(result)
+        if result_path.resolve() != raw_path.resolve() and result_path.exists():
+            result_path.rename(raw_path)
+
+        # Save raw as a new character reference if requested
+        if args.save_ref:
+            char_dir = config.get("emote_project", "")
+            if char_dir:
+                import shutil
+                ref_name = f"mike-{base_name}.png"
+                ref_dest = Path(char_dir) / ref_name
+                shutil.copy2(raw_path, ref_dest)
+                print(f"Saved reference: {ref_dest}", file=sys.stderr)
+
+        # Post-process: shape mask + resize
+        print(f"Applying {args.shape} mask at {len(sizes)} sizes...", file=sys.stderr)
+        saved = postprocess_emote(raw_path, args.shape, sizes, output_dir, base_name,
+                                  save_raw=args.raw, border=not args.no_border)
+        all_outputs.extend(saved)
+
+        # Print output paths to stdout
+        for p in saved:
+            print(p)
+
+    if not all_outputs and not args.cache:
+        print("No emotes generated.", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

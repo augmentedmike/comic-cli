@@ -34,19 +34,26 @@ except ImportError:
     print("Pillow required: pip install pillow", file=sys.stderr)
     sys.exit(1)
 
-# Gemini API key — same source as the rest of the project
-ENV_FILE = Path.home() / "Desktop" / "youtube-channel" / ".env"
+# Gemini API key — loaded from env or .env file
+_ENV_CANDIDATES = [
+    Path(__file__).resolve().parent.parent / ".env",
+    Path.home() / ".config" / "comic-cli" / ".env",
+]
 
 
 def load_api_key() -> str:
     key = os.getenv("GOOGLE_API_KEY", "")
-    if not key and ENV_FILE.exists():
-        for line in ENV_FILE.read_text().splitlines():
-            if line.startswith("GOOGLE_API_KEY="):
-                key = line.split("=", 1)[1].strip()
-                break
     if not key:
-        print("GOOGLE_API_KEY not found. Set it in the environment or in ~/Desktop/youtube-channel/.env",
+        for env_file in _ENV_CANDIDATES:
+            if env_file.exists():
+                for line in env_file.read_text().splitlines():
+                    if line.startswith("GOOGLE_API_KEY="):
+                        key = line.split("=", 1)[1].strip()
+                        break
+                if key:
+                    break
+    if not key:
+        print("GOOGLE_API_KEY not found. Set it in the environment or in .env",
               file=sys.stderr)
         sys.exit(1)
     return key

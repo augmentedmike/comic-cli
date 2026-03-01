@@ -29,6 +29,9 @@ import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Ensure lib/ is importable
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 
@@ -153,12 +156,26 @@ LAYOUTS: Dict[str, Layout] = {
 # Config  (same config.json as comic-express)
 # ---------------------------------------------------------------------------
 
-CONFIG_PATH = Path.home() / "Desktop" / "crabby" / "config.json"
+CONFIG_CANDIDATES = [
+    Path.home() / ".config" / "comic-cli" / "config.json",
+    Path.home() / "Desktop" / "crabby" / "config.json",
+]
+
+
+def _find_config() -> Path:
+    for p in CONFIG_CANDIDATES:
+        if p.exists():
+            return p
+    return CONFIG_CANDIDATES[0]
+
+
+CONFIG_PATH = _find_config()
 
 
 def load_config() -> Dict:
     if not CONFIG_PATH.exists():
-        print(f"Config not found: {CONFIG_PATH}", file=sys.stderr)
+        print(f"Config not found. Create one at: {CONFIG_CANDIDATES[0]}", file=sys.stderr)
+        print(f"  See examples/config.example.json for the format.", file=sys.stderr)
         sys.exit(1)
     with open(CONFIG_PATH) as f:
         cfg = json.load(f)
@@ -338,8 +355,119 @@ def draw_wrapped_text(
 
 
 # ---------------------------------------------------------------------------
+# Caption prompt helper — tell Gemini to render caption boxes in the art
+# ---------------------------------------------------------------------------
+
+def _build_caption_prompt(caption: str, panel_idx: int) -> str:
+    """Build Gemini prompt fragment for rendering a caption box in the panel."""
+    if not caption or not caption.strip():
+        return ""
+
+    place = "top" if (panel_idx % 2 == 0) else "bottom"
+
+    return (
+        f"\n\nCAPTION BOX — Include a narrative caption box at the {place} edge of the panel. "
+        f"The box is a solid dark rectangle (#0C0C0C background, slight transparency) "
+        f"spanning most of the panel width. "
+        f"White vertical accent bar on the left edge. "
+        f"Thin dark gray border (#282828). "
+        f"Typeset this exact text in bold white lettering inside the box: "
+        f'"{caption}"'
+    )
+
+
+# ---------------------------------------------------------------------------
 # Page compositor
 # ---------------------------------------------------------------------------
+
+def _draw_caption_overlay(
+    page: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    x: int, y: int, w: int, h: int,
+    caption: str,
+    panel_idx: int,
+):
+    """
+    Overlay a caption box ON the panel art.
+    Alternates top (even panels) and bottom (odd panels).
+    Dynamic height based on text content.
+    """
+    if not caption.strip():
+        return
+
+    # Scale font and spacing relative to panel width
+    FONT_SIZE    = max(28, int(w * 0.04))
+    PADDING_X    = max(20, int(w * 0.03))
+    PADDING_Y    = max(14, int(w * 0.02))
+    BOX_INSET    = max(12, int(w * 0.015))
+    LINE_SPACING = max(8, int(FONT_SIZE * 0.3))
+    ACCENT_BAR   = max(3, int(w * 0.004))
+    MAX_BOX_W    = 0.88
+
+    font = get_font(FONT_SIZE, bold=True)
+
+    max_box_w = int(w * MAX_BOX_W)
+    max_text_w = max_box_w - (PADDING_X * 2) - ACCENT_BAR
+
+    # Wrap text
+    words = caption.split()
+    lines: List[str] = []
+    current = ""
+    for word in words:
+        test = (current + " " + word).strip()
+        bbox = draw.textbbox((0, 0), test, font=font)
+        if bbox[2] <= max_text_w:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    if not lines:
+        return
+
+    line_h = FONT_SIZE + LINE_SPACING
+    text_block_h = len(lines) * line_h - LINE_SPACING
+    box_h = PADDING_Y * 2 + text_block_h
+    box_w = max_box_w
+    box_x = x + BOX_INSET
+
+    # Alternate top/bottom
+    place_top = (panel_idx % 2 == 0)
+    box_y = y + BOX_INSET if place_top else (y + h - BOX_INSET - box_h)
+
+    # Semi-transparent overlay via composited image
+    overlay = Image.new("RGBA", (box_w, box_h), (12, 12, 12, 220))
+    page.paste(Image.alpha_composite(
+        page.crop((box_x, box_y, box_x + box_w, box_y + box_h)).convert("RGBA"),
+        overlay,
+    ).convert("RGB"), (box_x, box_y))
+
+    # Refresh draw reference after paste
+    draw = ImageDraw.Draw(page)
+
+    # Accent bar
+    draw.rectangle(
+        [box_x, box_y, box_x + ACCENT_BAR, box_y + box_h],
+        fill=CAPTION_FG,
+    )
+
+    # Border
+    draw.rectangle(
+        [box_x, box_y, box_x + box_w, box_y + box_h],
+        outline=(40, 40, 40),
+        width=2,
+    )
+
+    # Text with drop shadow
+    text_x = box_x + PADDING_X + ACCENT_BAR
+    text_y = box_y + PADDING_Y
+    for line in lines:
+        draw.text((text_x + 1, text_y + 1), line, fill=(0, 0, 0), font=font)
+        draw.text((text_x, text_y), line, fill=CAPTION_FG, font=font)
+        text_y += line_h
+
 
 def composite_page(
     frame_paths: List[Optional[str]],
@@ -350,7 +478,6 @@ def composite_page(
 ) -> str:
     page  = Image.new("RGB", (PAGE_W, PAGE_H), BG_COLOR)
     draw  = ImageDraw.Draw(page)
-    c_font = get_font(22)
     t_font = get_font(36, bold=True)
     n_font = get_font(18)
 
@@ -361,38 +488,30 @@ def composite_page(
     for i, (rect, fpath, caption) in enumerate(zip(panel_rects, frame_paths, captions)):
         x, y, w, h = rect
 
-        # Outer border (slightly larger rectangle, then panel on top)
+        # Outer border
         draw.rectangle(
             [x - BORDER_W, y - BORDER_W, x + w + BORDER_W, y + h + BORDER_W],
             fill=BORDER_COLOR,
         )
 
-        # Image content area (above caption box)
-        content_h = h - CAPTION_H
-
+        # Art fills the FULL panel
+        # Anchor crop toward the caption edge so it doesn't get clipped
+        crop_anchor = (0.5, 0.0) if (i % 2 == 0) else (0.5, 1.0)
         if fpath and Path(fpath).exists():
             try:
                 frame = Image.open(fpath).convert("RGB")
-                frame = ImageOps.fit(frame, (w, content_h), Image.LANCZOS)
+                frame = ImageOps.fit(frame, (w, h), Image.LANCZOS,
+                                     centering=crop_anchor)
                 page.paste(frame, (x, y))
             except Exception as e:
                 logger.warning(f"Panel {i+1}: could not load {fpath}: {e}")
-                _placeholder(draw, x, y, w, content_h, i + 1, n_font)
+                _placeholder(draw, x, y, w, h, i + 1, n_font)
         else:
-            _placeholder(draw, x, y, w, content_h, i + 1, n_font)
+            _placeholder(draw, x, y, w, h, i + 1, n_font)
 
-        # Caption box
-        cap_y = y + content_h
-        draw.rectangle([x, cap_y, x + w, y + h], fill=CAPTION_BG)
-        if caption:
-            draw_wrapped_text(
-                draw, caption, c_font,
-                x + 10, cap_y + 10,
-                w - 20, CAPTION_H - 20,
-                CAPTION_FG,
-            )
+        # Captions are now baked into panel art by Gemini — no Pillow overlay
 
-        # Small panel number, top-left
+        # Small panel number
         draw.text((x + 8, y + 6), str(i + 1), font=n_font, fill=(220, 220, 220))
 
     page.save(output_path, "PNG", dpi=(300, 300))
@@ -579,10 +698,13 @@ def generate_frames(
             out.unlink()
 
         logger.info(f"[{i}/{len(scenes)}] Generating panel {sid} — {scene['caption'][:50]}...")
+        prompt_with_caption = scene["prompt"] + _build_caption_prompt(
+            scene.get("caption", ""), i - 1,
+        )
         result = gen.generate_portrait(
             person_image_path=reference,
             style_image_paths=styles,
-            prompt=scene["prompt"],
+            prompt=prompt_with_caption,
             output_name=fname,
         )
         if result:
@@ -638,10 +760,13 @@ def generate_spread(
     datestamp: str,
     title: Optional[str],
     output_stem: Optional[str],
+    locales: Optional[List[str]] = None,
+    source_locale: str = "en",
 ) -> List[str]:
     """
     Split scenes + frame_paths across n_pages and composite each page.
-    Returns list of output file paths (one per page).
+    When locales is set, composites each page once per locale with translated captions.
+    Returns list of output file paths.
     """
     total     = len(scenes)
     # Distribute panels as evenly as possible across pages
@@ -665,30 +790,46 @@ def generate_spread(
         total_slots = count_panels(layout)
         layout_desc = page_hint or f"auto-{pg_size}"
 
-        pg_captions = [s.get("caption", "") for s in pg_scenes]
-        while len(pg_frames)   < total_slots: pg_frames.append(None)
-        while len(pg_captions) < total_slots: pg_captions.append("")
+        while len(pg_frames) < total_slots: pg_frames.append(None)
 
-        # Output filename
-        if output_stem and n_pages == 1:
-            out_path = output_stem
-        elif output_stem:
-            stem = Path(output_stem)
-            out_path = str(stem.parent / f"{stem.stem}-p{pg_idx}{stem.suffix}")
-        else:
-            out_path = str(output_dir / f"comic-{datestamp}-p{pg_idx}.png")
+        panel_rects = compute_panel_rects(layout)
 
-        pg_title = f"{title} — p.{pg_idx}" if title else None
-        logger.info(f"Compositing page {pg_idx}/{n_pages}: layout={layout_desc}, panels={pg_size}")
+        # Determine which locales to composite
+        locale_list = locales if locales else [None]
 
-        composite_page(
-            frame_paths=pg_frames,
-            panel_rects=compute_panel_rects(layout),
-            captions=pg_captions,
-            output_path=out_path,
-            title=pg_title,
-        )
-        out_paths.append(out_path)
+        for locale in locale_list:
+            # Resolve captions for this locale
+            if locale is not None:
+                from translate import resolve_captions
+                pg_captions = resolve_captions(pg_scenes, locale, source_locale)
+            else:
+                pg_captions = [s.get("caption", "") for s in pg_scenes]
+
+            while len(pg_captions) < total_slots: pg_captions.append("")
+
+            # Output filename with locale suffix
+            locale_suffix = f"_{locale}" if locale else ""
+
+            if output_stem and n_pages == 1:
+                stem = Path(output_stem)
+                out_path = str(stem.parent / f"{stem.stem}{locale_suffix}{stem.suffix}")
+            elif output_stem:
+                stem = Path(output_stem)
+                out_path = str(stem.parent / f"{stem.stem}-p{pg_idx}{locale_suffix}{stem.suffix}")
+            else:
+                out_path = str(output_dir / f"comic-{datestamp}-p{pg_idx}{locale_suffix}.png")
+
+            pg_title = f"{title} — p.{pg_idx}" if title else None
+            logger.info(f"Compositing page {pg_idx}/{n_pages} [{locale or 'default'}]: layout={layout_desc}, panels={pg_size}")
+
+            composite_page(
+                frame_paths=list(pg_frames),
+                panel_rects=panel_rects,
+                captions=pg_captions,
+                output_path=out_path,
+                title=pg_title,
+            )
+            out_paths.append(out_path)
 
     return out_paths
 
@@ -736,6 +877,10 @@ Page spec: 6.625 x 10.25 in @ 300 DPI = 1988 x 3075 px
                         help="Page title text (shown in top margin)")
     parser.add_argument("--cache",           action="store_true",
                         help="Reuse already-generated panel images")
+    parser.add_argument("--locale",          default=None,
+                        help="Comma-separated locales for captioning, e.g. 'en,es' (omit for backward compat)")
+    parser.add_argument("--source-locale",   default="en",
+                        help="Source caption locale (default: en)")
     parser.add_argument("--list-layouts",    action="store_true",
                         help="List built-in layout presets and exit")
     parser.add_argument("--verbose",   "-v", action="store_true")
@@ -833,6 +978,9 @@ Page spec: 6.625 x 10.25 in @ 300 DPI = 1988 x 3075 px
     # Composite: single page or multi-page spread
     # ------------------------------------------------------------------
 
+    # Parse locale list
+    locales = [l.strip() for l in args.locale.split(",")] if args.locale else None
+
     out_paths = generate_spread(
         scenes=scenes,
         frame_paths=frame_paths,
@@ -842,6 +990,8 @@ Page spec: 6.625 x 10.25 in @ 300 DPI = 1988 x 3075 px
         datestamp=datestamp,
         title=args.title,
         output_stem=args.output,
+        locales=locales,
+        source_locale=args.source_locale,
     )
 
     for p in out_paths:

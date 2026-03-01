@@ -30,13 +30,27 @@ warnings.filterwarnings("ignore", message=".*urllib3.*")
 # Config
 # ---------------------------------------------------------------------------
 
-CONFIG_PATH = Path.home() / "Desktop" / "crabby" / "config.json"
+CONFIG_CANDIDATES = [
+    Path.home() / ".config" / "comic-cli" / "config.json",
+    Path.home() / "Desktop" / "crabby" / "config.json",
+]
+
+
+def _find_config() -> Path:
+    for p in CONFIG_CANDIDATES:
+        if p.exists():
+            return p
+    return CONFIG_CANDIDATES[0]  # default for error message
+
+
+CONFIG_PATH = _find_config()
 
 
 def load_config():
-    """Load config from ~/.crabby/config.json."""
+    """Load config from ~/.config/comic-cli/config.json (or legacy ~/Desktop/crabby/config.json)."""
     if not CONFIG_PATH.exists():
-        print(f"Config not found: {CONFIG_PATH}", file=sys.stderr)
+        print(f"Config not found. Create one at: {CONFIG_CANDIDATES[0]}", file=sys.stderr)
+        print(f"  See examples/config.example.json for the format.", file=sys.stderr)
         sys.exit(1)
     with open(CONFIG_PATH) as f:
         cfg = json.load(f)

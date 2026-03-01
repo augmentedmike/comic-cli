@@ -32,6 +32,9 @@ import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Ensure lib/ is importable
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 try:
@@ -403,20 +406,68 @@ def get_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
-def draw_wrapped(draw, text, font, x, y, max_w, max_h, color):
-    words, lines, cur = text.split(), [], ""
+def _draw_caption_overlay(
+    page: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    x: int, y: int, w: int, h: int,
+    caption: str,
+    panel_idx: int,
+):
+    """Overlay a caption box ON the panel art, alternating top/bottom."""
+    if not caption.strip():
+        return
+
+    # Scale font and spacing relative to panel width
+    FONT_SIZE    = max(28, int(w * 0.04))
+    PADDING_X    = max(20, int(w * 0.03))
+    PADDING_Y    = max(14, int(w * 0.02))
+    BOX_INSET    = max(12, int(w * 0.015))
+    LINE_SPACING = max(8, int(FONT_SIZE * 0.3))
+    ACCENT_BAR   = max(3, int(w * 0.004))
+    MAX_BOX_W    = 0.88
+
+    font = get_font(FONT_SIZE, bold=True)
+
+    max_box_w = int(w * MAX_BOX_W)
+    max_text_w = max_box_w - (PADDING_X * 2) - ACCENT_BAR
+
+    words = caption.split()
+    lines, current = [], ""
     for word in words:
-        test = (cur + " " + word).strip()
-        if draw.textbbox((0, 0), test, font=font)[2] <= max_w:
-            cur = test
+        test = (current + " " + word).strip()
+        if draw.textbbox((0, 0), test, font=font)[2] <= max_text_w:
+            current = test
         else:
-            if cur: lines.append(cur)
-            cur = word
-    if cur: lines.append(cur)
-    lh = (font.size if hasattr(font, "size") else 16) + 5
-    for i, line in enumerate(lines):
-        if i * lh >= max_h: break
-        draw.text((x, y + i * lh), line, font=font, fill=color)
+            if current: lines.append(current)
+            current = word
+    if current: lines.append(current)
+    if not lines: return
+
+    line_h = FONT_SIZE + LINE_SPACING
+    text_block_h = len(lines) * line_h - LINE_SPACING
+    box_h = PADDING_Y * 2 + text_block_h
+    box_w = max_box_w
+    box_x = x + BOX_INSET
+
+    place_top = (panel_idx % 2 == 0)
+    box_y = y + BOX_INSET if place_top else (y + h - BOX_INSET - box_h)
+
+    overlay = Image.new("RGBA", (box_w, box_h), (12, 12, 12, 220))
+    page.paste(Image.alpha_composite(
+        page.crop((box_x, box_y, box_x + box_w, box_y + box_h)).convert("RGBA"),
+        overlay,
+    ).convert("RGB"), (box_x, box_y))
+
+    draw = ImageDraw.Draw(page)
+    draw.rectangle([box_x, box_y, box_x + ACCENT_BAR, box_y + box_h], fill=CAPTION_FG)
+    draw.rectangle([box_x, box_y, box_x + box_w, box_y + box_h], outline=(40, 40, 40), width=2)
+
+    text_x = box_x + PADDING_X + ACCENT_BAR
+    text_y = box_y + PADDING_Y
+    for line in lines:
+        draw.text((text_x + 1, text_y + 1), line, fill=(0, 0, 0), font=font)
+        draw.text((text_x, text_y), line, fill=CAPTION_FG, font=font)
+        text_y += line_h
 
 
 def composite_page(
@@ -428,7 +479,6 @@ def composite_page(
 ) -> str:
     page  = Image.new("RGB", (PAGE_W, PAGE_H), BG_COLOR)
     draw  = ImageDraw.Draw(page)
-    c_fnt = get_font(22)
     t_fnt = get_font(38, bold=True)
     n_fnt = get_font(18)
 
@@ -439,24 +489,21 @@ def composite_page(
         x, y, w, h = rect
         draw.rectangle([x - BORDER_W, y - BORDER_W, x + w + BORDER_W, y + h + BORDER_W],
                        fill=BORDER_COLOR)
-        content_h = h - CAPTION_H
 
         if fpath and Path(fpath).exists():
             try:
                 frame = Image.open(fpath).convert("RGB")
-                # Crop-to-fill preserves aspect ratio — no stretching
-                frame = ImageOps.fit(frame, (w, content_h), Image.LANCZOS)
+                frame = ImageOps.fit(frame, (w, h), Image.LANCZOS)
                 page.paste(frame, (x, y))
             except Exception as e:
                 logger.warning(f"Panel {i+1}: {e}")
-                _placeholder(draw, x, y, w, content_h, i + 1, n_fnt)
+                _placeholder(draw, x, y, w, h, i + 1, n_fnt)
         else:
-            _placeholder(draw, x, y, w, content_h, i + 1, n_fnt)
+            _placeholder(draw, x, y, w, h, i + 1, n_fnt)
 
-        cap_y = y + content_h
-        draw.rectangle([x, cap_y, x + w, y + h], fill=CAPTION_BG)
         if cap:
-            draw_wrapped(draw, cap, c_fnt, x + 10, cap_y + 10, w - 20, CAPTION_H - 20, CAPTION_FG)
+            _draw_caption_overlay(page, draw, x, y, w, h, cap, i)
+            draw = ImageDraw.Draw(page)
         draw.text((x + 8, y + 6), str(i + 1), font=n_fnt, fill=(220, 220, 220))
 
     page.save(output_path, "PNG", dpi=(300, 300))
@@ -543,13 +590,14 @@ def generate_html(
     date_str: str,
     page_paths: List[str],
     style: str = DEFAULT_STYLE,
+    locale: str = "en",
 ) -> str:
     pages_html = "\n".join(
         f'    <img src="{Path(p).name}" alt="Page {i+1}" class="comic-page">'
         for i, p in enumerate(page_paths)
     )
     return f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="{locale}">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -638,7 +686,14 @@ def generate_spread(
     datestamp:   str,
     title:       Optional[str],
     output_stem: Optional[str],
+    locales:     Optional[List[str]] = None,
+    source_locale: str = "en",
 ) -> List[str]:
+    """
+    Split scenes + frame_paths across n_pages and composite each page.
+    When locales is set, composites each page once per locale with translated captions.
+    Returns list of output file paths.
+    """
     total      = len(scenes)
     base, rem  = divmod(total, n_pages)
     page_sizes = [base + (1 if i < rem else 0) for i in range(n_pages)]
@@ -657,28 +712,42 @@ def generate_spread(
         layout      = resolve_layout(pg_size, hint)
         total_slots = count_panels(layout)
 
-        pg_captions = [s.get("caption", "") for s in pg_scenes]
-        while len(pg_frames)   < total_slots: pg_frames.append(None)
-        while len(pg_captions) < total_slots: pg_captions.append("")
+        while len(pg_frames) < total_slots: pg_frames.append(None)
 
-        if output_stem and n_pages == 1:
-            out_path = output_stem
-        elif output_stem:
-            stem = Path(output_stem)
-            out_path = str(stem.parent / f"{stem.stem}-p{pg_idx}{stem.suffix}")
-        else:
-            out_path = str(output_dir / f"comic-{datestamp}-p{pg_idx}.png")
+        panel_rects = compute_panel_rects(layout)
+        locale_list = locales if locales else [None]
 
-        pg_title = f"{title} — p.{pg_idx}" if title else None
-        logger.info(f"Compositing page {pg_idx}/{n_pages} ({hint or 'auto'}, {pg_size} panels)")
-        composite_page(
-            frame_paths=pg_frames,
-            panel_rects=compute_panel_rects(layout),
-            captions=pg_captions,
-            output_path=out_path,
-            title=pg_title,
-        )
-        out_paths.append(out_path)
+        for locale in locale_list:
+            # Resolve captions for this locale
+            if locale is not None:
+                from translate import resolve_captions
+                pg_captions = resolve_captions(pg_scenes, locale, source_locale)
+            else:
+                pg_captions = [s.get("caption", "") for s in pg_scenes]
+
+            while len(pg_captions) < total_slots: pg_captions.append("")
+
+            locale_suffix = f"_{locale}" if locale else ""
+
+            if output_stem and n_pages == 1:
+                stem = Path(output_stem)
+                out_path = str(stem.parent / f"{stem.stem}{locale_suffix}{stem.suffix}")
+            elif output_stem:
+                stem = Path(output_stem)
+                out_path = str(stem.parent / f"{stem.stem}-p{pg_idx}{locale_suffix}{stem.suffix}")
+            else:
+                out_path = str(output_dir / f"comic-{datestamp}-p{pg_idx}{locale_suffix}.png")
+
+            pg_title = f"{title} — p.{pg_idx}" if title else None
+            logger.info(f"Compositing page {pg_idx}/{n_pages} [{locale or 'default'}] ({hint or 'auto'}, {pg_size} panels)")
+            composite_page(
+                frame_paths=list(pg_frames),
+                panel_rects=panel_rects,
+                captions=pg_captions,
+                output_path=out_path,
+                title=pg_title,
+            )
+            out_paths.append(out_path)
     return out_paths
 
 # ---------------------------------------------------------------------------
@@ -722,6 +791,10 @@ Page spec: 6.625 x 10.25 in @ 300 DPI = 1988 x 3075 px
                         help="Output directory (default: ~/Desktop/comic-blog/YYYY-MM-DD/)")
     parser.add_argument("--cache",          action="store_true", help="Reuse already-generated panels")
     parser.add_argument("--no-html",        action="store_true", help="Skip HTML blog generation")
+    parser.add_argument("--locale",         default=None,
+                        help="Comma-separated locales for captioning, e.g. 'en,es' (omit for backward compat)")
+    parser.add_argument("--source-locale",  default="en",
+                        help="Source caption locale (default: en)")
     parser.add_argument("--list-styles",    action="store_true", help="List art styles and exit")
     parser.add_argument("--list-layouts",   action="store_true", help="List layout presets and exit")
     parser.add_argument("--config",         action="store_true", help="Show/create config and exit")
@@ -843,6 +916,9 @@ Page spec: 6.625 x 10.25 in @ 300 DPI = 1988 x 3075 px
     # Composite pages
     # ------------------------------------------------------------------
 
+    # Parse locale list
+    locales = [l.strip() for l in args.locale.split(",")] if args.locale else None
+
     page_paths = generate_spread(
         scenes=scenes,
         frame_paths=frame_paths,
@@ -852,22 +928,43 @@ Page spec: 6.625 x 10.25 in @ 300 DPI = 1988 x 3075 px
         datestamp=datestamp,
         title=title,
         output_stem=None,
+        locales=locales,
+        source_locale=args.source_locale,
     )
 
     # ------------------------------------------------------------------
-    # Generate HTML blog post
+    # Generate HTML blog post(s)
     # ------------------------------------------------------------------
 
+    html_paths: List[Path] = []
     if not args.no_html:
-        html_path = output_dir / "index.html"
-        html = generate_html(
-            title=title,
-            date_str=datestamp,
-            page_paths=page_paths,
-            style=config.get("style", DEFAULT_STYLE),
-        )
-        html_path.write_text(html)
-        logger.info(f"✓ Blog post → {html_path}")
+        if locales:
+            # Generate one HTML per locale, referencing locale-suffixed page images
+            for locale in locales:
+                locale_pages = [p for p in page_paths if f"_{locale}.png" in p]
+                suffix = f"_{locale}"
+                html_path = output_dir / f"index{suffix}.html"
+                html = generate_html(
+                    title=title,
+                    date_str=datestamp,
+                    page_paths=locale_pages,
+                    style=config.get("style", DEFAULT_STYLE),
+                    locale=locale,
+                )
+                html_path.write_text(html)
+                html_paths.append(html_path)
+                logger.info(f"✓ Blog post [{locale}] → {html_path}")
+        else:
+            html_path = output_dir / "index.html"
+            html = generate_html(
+                title=title,
+                date_str=datestamp,
+                page_paths=page_paths,
+                style=config.get("style", DEFAULT_STYLE),
+            )
+            html_path.write_text(html)
+            html_paths.append(html_path)
+            logger.info(f"✓ Blog post → {html_path}")
 
     # ------------------------------------------------------------------
     # Output
@@ -875,8 +972,8 @@ Page spec: 6.625 x 10.25 in @ 300 DPI = 1988 x 3075 px
 
     for p in page_paths:
         print(p)
-    if not args.no_html:
-        print(output_dir / "index.html")
+    for hp in html_paths:
+        print(hp)
 
 
 if __name__ == "__main__":
